@@ -8,6 +8,7 @@ from pathlib import Path
 import pty
 import re
 import shlex
+import shutil
 import signal
 import socket
 import struct
@@ -19,6 +20,10 @@ import threading
 import time
 import uuid
 import pyte
+
+# Private post-mortem copies of the last run: client screen, transcript and logs.
+DEBUG = Path(tempfile.gettempdir())/'grill-smoke-debug'
+
 
 class Screen(pyte.Screen):
     def report_device_status(self, mode, **kwargs):
@@ -167,6 +172,14 @@ def control(path, action):
                 pass
         subprocess.run([info['binary'],'--session',info['session'],'server','stop'],env=env,
                        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        # Drop only this run's unique session directory from the Herdr config.
+        sessions=Path(info['env']['HERDR_SOCKET_PATH']).parent
+        if sessions.name==info['session'] and sessions.name.startswith('grill-test-'):
+            try:
+                until(lambda: not Path(info['env']['HERDR_SOCKET_PATH']).exists(),'test server stop',timeout=10)
+                shutil.rmtree(sessions,ignore_errors=True)
+            except RuntimeError:
+                pass  # Never mask the test's own failure from inside cleanup.
         return {'cleaned':True}
     raise ValueError(action)
 
@@ -221,6 +234,7 @@ def main():
     screen_buffer=Screen(160,48)
     terminal_stream=pyte.ByteStream(screen_buffer)
     screen_lock=threading.Lock()
+    DEBUG.mkdir(mode=0o700,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='grill-client-', dir='/tmp') as temp:
         tmp=Path(temp)
         client_env=env.copy()
@@ -241,8 +255,10 @@ def main():
                 (catalog.parent/'endpoint-selection.json').write_text(json.dumps({'version':1,'selected_profile':selected}))
                 launch=[binary,'--session','grill-client-'+uuid.uuid4().hex[:8]]
             else:
-                # Local mode uses the fixture's real session config.
-                client_env=env.copy();client_env.update(TERM='xterm-256color',COLORTERM='truecolor')
+                # The real config locates the test session; a private state dir hides
+                # the owner's saved machines and their live selection from this client.
+                client_env=env.copy();client_env.update(XDG_STATE_HOME=str(tmp/'state'),
+                                                         TERM='xterm-256color',COLORTERM='truecolor')
                 launch=[binary,'--session',info['session']]
             def attach():
                 nonlocal client,master
@@ -281,7 +297,7 @@ def main():
                             return (line.index('Подтвердить ответ')+4, row+1)
             time.sleep(.5)
             x,y=until(button_position,'confirm button geometry')
-            Path('/tmp/grill-mouse.json').write_text(json.dumps({'x':x,'y':y,'screen':screen_buffer.display},ensure_ascii=False))
+            (DEBUG/'mouse.json').write_text(json.dumps({'x':x,'y':y,'screen':screen_buffer.display},ensure_ascii=False))
             # Honor the outer client's selected mouse encoding, including pixel mode.
             raw=bytes(transcript)
             if raw.rfind(b'\x1b[?1016h') > raw.rfind(b'\x1b[?1016l'):
@@ -307,9 +323,9 @@ def main():
                               'remote':args.remote,'session':info['session'],
                               'checks':['render','unicode-multiline-paste','mouse-confirm','reconnect','reopen','two-turn-chat','compact-submit','agent-notice','owned-tab-cleanup']},ensure_ascii=False))
         finally:
-            Path('/tmp/grill-client-transcript.txt').write_bytes(transcript)
+            (DEBUG/'client-transcript.txt').write_bytes(transcript)
             for log in tmp.rglob('*.log'):
-                Path('/tmp/grill-'+log.name).write_bytes(log.read_bytes())
+                (DEBUG/log.name).write_bytes(log.read_bytes())
             if client and client.poll() is None:
                 stop_process(client)
             if master is not None:
