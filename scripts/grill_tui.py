@@ -6,6 +6,7 @@ import copy
 import fcntl
 import json
 import subprocess
+import time
 from pathlib import Path
 from rich.table import Table
 from rich.text import Text
@@ -16,8 +17,7 @@ from textual.drivers.linux_driver import LinuxDriver
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
-from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, Footer, Input, Label, OptionList, Select, Static, TextArea
+from textual.widgets import Button, Footer, Input, Label, OptionList, Select, Static, TextArea
 from grill_client import Client
 from grill_harness import HARNESSES, label
 from grill_ui import read, write
@@ -27,10 +27,13 @@ CUSTOM = '__custom__'
 PALETTE = {'bg': '#121314', 'panel': '#161718', 'surface': '#1c1d1f', 'raised': '#232527',
            'line': '#2a2b2c', 'line-strong': '#3a3d41', 'text': '#bbbebf', 'strong': '#e2e5e7',
            'muted': '#8b949e', 'faint': '#5c636b', 'accent': '#79c0ff', 'accent-dim': '#1d3a57',
-           'ok': '#7ee787', 'warn': '#cd9731', 'err': '#ff7b72'}
+           'ok': '#7ee787', 'warn': '#cd9731', 'err': '#ff7b72',
+           # Herdr's own divider and selected-row colors, so the tab reads as part of Herdr.
+           'divider': '#33363a', 'selection': '#2a2b2c'}
 MODES = {'single': 'Один вариант', 'multiple': 'Несколько вариантов', 'text': 'Свободный ответ'}
 SUBMITTED = 'Все ответы отправлены. Нажмите «К агенту» и напишите агенту «Готово».'
-AGENT_NOTIFIED = 'Все ответы отправлены, агент получил «Готово». Нажмите «К агенту».'
+ALL_CONFIRMED = 'Все ответы подтверждены. Нажмите «Отправить все ответы» или Enter на этой кнопке.'
+AGENT_NOTIFIED = 'Все ответы отправлены, агент получил «Готово» и путь к файлу: {path}'
 
 
 class CellMouseDriver(LinuxDriver):
@@ -69,12 +72,20 @@ class Composer(TextArea):
 
 class ChoiceList(OptionList):
     """Options with the description under the label; SelectionList shows one line only."""
-    BINDINGS = [Binding('space', 'select', 'Выбрать', show=False)]
+    # Space toggles; Enter confirms the answer, as in the answer field.
+    BINDINGS = [Binding('space', 'select', 'Выбрать', show=False),
+                Binding('enter', 'submit', 'Подтвердить', show=False)]
 
     class Toggled(Message):
         def __init__(self, choices):
             super().__init__()
             self.choices = choices
+
+    class Submitted(Message):
+        pass
+
+    def action_submit(self):
+        self.post_message(self.Submitted())
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -88,8 +99,6 @@ class ChoiceList(OptionList):
         highlighted = self.highlighted if highlighted is None else highlighted
         self.clear_options()
         for index, o in enumerate(self.choices):
-            if index:
-                self.add_option(None)  # A blank separator between options.
             chosen = o['id'] in self.selected
             if self.mode == 'multiple':
                 mark = '■' if chosen else '□'
@@ -99,6 +108,8 @@ class ChoiceList(OptionList):
             text.append(o['label'], style=f"bold {PALETTE['accent' if chosen else 'strong']}")
             if o.get('description'):
                 text.append('\n' + o['description'], style=PALETTE['muted'])
+            if index < len(self.choices) - 1:
+                text.append('\n')  # Breathing room; a drawn separator would show on a transparent background.
             row = Table.grid(padding=(0, 1))
             row.add_column(width=1)
             row.add_column(ratio=1)
@@ -110,7 +121,6 @@ class ChoiceList(OptionList):
     @on(OptionList.OptionSelected)
     def toggle(self, event):
         event.stop()
-        # Separators are not options, so option_index already skips them.
         value = self.choices[event.option_index]['id']
         if value in self.selected:
             self.selected.remove(value)
@@ -131,43 +141,53 @@ def chat_message(role, text, author):
     return Static(body, classes='msg ' + ('msg-user' if role == 'user' else 'msg-agent'))
 
 
-class AgentScreen(ModalScreen):
-    """Harness, model and effort for new chats. Lists come from the installed CLIs."""
-    BINDINGS = [('escape', 'cancel', 'Отмена')]
-    CSS = '''
-    AgentScreen { align: center middle; background: $bg 60%; }
-    #agent-box { width: 64; max-width: 100%; height: auto; max-height: 100%;
-                 padding: 1 3; background: $surface; border: tall $line-strong; }
-    #agent-title { color: $strong; text-style: bold; }
-    #agent-box Label { margin-top: 1; color: $muted; }
-    #agent-box Select, #agent-box Input { width: 100%; }
-    #agent-box Select, #agent-box Select:focus { border: none; }
-    #agent-box SelectCurrent { border: tall $raised; background: $raised; }
-    #agent-box Select:focus > SelectCurrent { border: tall $accent; }
-    #agent-box SelectOverlay { border: tall $line-strong; background: $raised; }
-    #agent-box Input { border: tall $raised; background: $raised; }
-    #agent-box Input:focus { border: tall $accent; }
-    #agent-box Checkbox { border: none; background: $surface; padding: 0; }
-    #agent-box Checkbox > .toggle--button { color: $raised; background: $raised; }
-    #agent-box Checkbox.-on > .toggle--button { color: $bg; background: $accent; }
-    #agent-custom { margin-top: 1; }
-    #agent-restart { margin-top: 1; }
-    #agent-note { height: auto; color: $muted; margin-top: 1; }
-    #agent-error { height: auto; color: $err; }
-    #agent-buttons { height: auto; margin-top: 1; align-horizontal: right; }
-    #agent-buttons Button { margin-left: 2; }
-    '''
+class AgentPicker(Vertical):
+    """Harness, model and effort for new chats, inline in the discussion panel.
 
-    def __init__(self, catalog, current, parent, chat):
-        super().__init__()
+    Lists come from the installed CLIs via the server catalog.
+    """
+
+    class Changed(Message):
+        def __init__(self, runtime, restart=False):
+            super().__init__()
+            self.runtime, self.restart = runtime, restart
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.catalog = {'ready': False, 'harnesses': {}}
+        self.harnesses = {}
+        self.choice = {}
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id='agent-row'):
+            yield Select([('…', '')], allow_blank=False, compact=True, id='agent-harness')
+            yield Select([('…', CUSTOM)], allow_blank=False, compact=True, id='agent-model')
+            yield Select([('…', '')], allow_blank=False, compact=True, id='agent-effort')
+        yield Input(placeholder='ID модели, как его принимает CLI · Enter', compact=True, id='agent-custom')
+        with Horizontal(id='agent-chat'):
+            yield Static('', id='agent-note')
+            yield Button('Новый чат', id='agent-restart', compact=True)
+
+    def load(self, catalog, current, parent, chat):
+        """Show `current` (the runtime for new chats) without emitting Changed."""
+        self.catalog = catalog
         known = catalog.get('harnesses') or {}
-        self.ready = catalog.get('ready', False)
         self.harnesses = {hid: known.get(hid) or {'label': h.label, 'available': h.available(),
                           'models': [], 'efforts': h.fallback_efforts} for hid, h in HARNESSES.items()}
         # Remember the last choice per harness, so switching back restores it.
         self.choice = {r['harness']: dict(r) for r in (parent, current) if r.get('harness') in self.harnesses}
-        self.current = current
-        self.chat = chat
+        # With no CLI installed, still list all; the server reports the missing one.
+        available = ([(e['label'], hid) for hid, e in self.harnesses.items() if e['available']]
+                     or [(e['label'], hid) for hid, e in self.harnesses.items()])
+        hid = current['harness'] if any(h == current['harness'] for _, h in available) else available[0][1]
+        harness = self.query_one('#agent-harness', Select)
+        with self.prevent(Select.Changed):
+            harness.set_options(available)
+            harness.value = hid
+            self.fill_models()
+        note = self.query_one('#agent-note', Static)
+        note.update(f'Этот чат ведёт {label(chat)}' if chat else '')
+        self.query_one('#agent-chat').display = bool(chat)
 
     def models(self, hid):
         entry = self.harnesses[hid]
@@ -180,42 +200,6 @@ class AgentScreen(ModalScreen):
     def efforts(self, hid, model):
         listed = next((m for m in self.models(hid) if m['id'] == model), None)
         return listed['efforts'] if listed else self.harnesses[hid]['efforts']
-
-    def compose(self) -> ComposeResult:
-        # With no CLI installed, still show all; the server reports the missing one.
-        available = ([(e['label'], hid) for hid, e in self.harnesses.items() if e['available']]
-                     or [(e['label'], hid) for hid, e in self.harnesses.items()])
-        hid = self.current['harness'] if self.harnesses.get(self.current['harness'], {}).get('available') else available[0][1]
-        with Vertical(id='agent-box'):
-            yield Static('Агент для новых чатов', id='agent-title')
-            yield Label('Харнесс')
-            yield Select(available, allow_blank=False, value=hid, id='agent-harness')
-            yield Label('Модель')
-            yield Select([('…', CUSTOM)], allow_blank=False, id='agent-model')
-            yield Input(placeholder='ID модели, как его принимает CLI', id='agent-custom')
-            yield Label('Effort')
-            yield Select([('…', '')], allow_blank=False, id='agent-effort')
-            if self.chat:
-                yield Checkbox('Начать чат этого вопроса заново', id='agent-restart')
-            yield Static(self.note(), id='agent-note', markup=False)
-            yield Static('', id='agent-error', markup=False)
-            with Horizontal(id='agent-buttons'):
-                yield Button('Отмена', id='agent-cancel', compact=True)
-                yield Button('Применить', id='agent-apply', variant='primary', compact=True)
-
-    def note(self):
-        lines = ['Применяется к новым чатам.']
-        if self.chat:
-            lines.append(f'Начатый чат продолжит {label(self.chat)}: история хранится в его сессии.')
-        missing = [e['label'] for e in self.harnesses.values() if not e['available']]
-        if missing:
-            lines.append('Не установлен: ' + ', '.join(missing) + '.')
-        if not self.ready:
-            lines.append('Список моделей ещё загружается; ID можно ввести вручную.')
-        return ' '.join(lines)
-
-    def on_mount(self):
-        self.fill_models()
 
     def fill_models(self):
         hid = self.query_one('#agent-harness', Select).value
@@ -241,31 +225,47 @@ class AgentScreen(ModalScreen):
             select.set_options([(e, e) for e in efforts])
             select.value = wanted
 
-    @on(Select.Changed)
-    def changed(self, event):
-        if event.select.id == 'agent-harness':
-            self.fill_models()
-        elif event.select.id == 'agent-model':
-            self.fill_efforts()
-
-    @on(Button.Pressed)
-    def pressed(self, event):
-        event.stop()
-        if event.button.id == 'agent-cancel':
-            self.dismiss(None)
-            return
+    def runtime(self):
         model = self.query_one('#agent-model', Select).value
         if model == CUSTOM:
             model = self.query_one('#agent-custom', Input).value.strip()
         if not model:
-            self.query_one('#agent-error', Static).update('Укажите ID модели.')
-            return
-        restart = bool(self.chat) and self.query_one('#agent-restart', Checkbox).value
-        self.dismiss({'runtime': {'harness': self.query_one('#agent-harness', Select).value, 'model': model,
-                                  'effort': self.query_one('#agent-effort', Select).value}, 'restart': restart})
+            return None
+        return {'harness': self.query_one('#agent-harness', Select).value, 'model': model,
+                'effort': self.query_one('#agent-effort', Select).value}
 
-    def action_cancel(self):
-        self.dismiss(None)
+    def emit(self, restart=False):
+        runtime = self.runtime()
+        if runtime:
+            self.choice[runtime['harness']] = dict(runtime)
+            self.post_message(self.Changed(runtime, restart))
+
+    @on(Select.Changed)
+    def changed(self, event):
+        event.stop()
+        harness = self.query_one('#agent-harness', Select).value
+        if harness not in self.harnesses:
+            return  # Placeholder values before the first load.
+        if event.select.id == 'agent-harness':
+            with self.prevent(Select.Changed):
+                self.fill_models()
+        elif event.select.id == 'agent-model':
+            with self.prevent(Select.Changed):
+                self.fill_efforts()
+            if event.value == CUSTOM:
+                self.query_one('#agent-custom', Input).focus()
+                return  # Applied once the owner types the model ID.
+        self.emit()
+
+    @on(Input.Submitted, '#agent-custom')
+    def custom(self, event):
+        event.stop()
+        self.emit()
+
+    @on(Button.Pressed, '#agent-restart')
+    def restart(self, event):
+        event.stop()
+        self.emit(restart=True)
 
 
 class GrillApp(App):
@@ -277,9 +277,10 @@ class GrillApp(App):
                 Binding('f4', 'answer_field', 'Ответ', priority=True),
                 Binding('f5', 'agent', 'Агент', priority=True),
                 Binding('f6', 'message_field', 'Сообщение', priority=True),
+                Binding('f7', 'toggle_discussion', 'Скрыть чат', priority=True),
                 ('ctrl+s', 'confirm', 'Подтвердить'), ('ctrl+q', 'leave', 'Выйти')]
     CSS = '''
-    Screen { background: $bg; color: $text; }
+    Screen { background: ansi_default; color: $text; }
     Button { border: none; height: 1; min-width: 0; padding: 0 2;
              background: $raised; color: $text; text-style: none; }
     Button:hover { background: $line-strong; color: $strong; }
@@ -289,22 +290,22 @@ class GrillApp(App):
     Button.-primary:focus, Button.-success:focus { background: $strong; color: $bg; }
     Button:disabled { background: $surface; color: $faint; text-style: none; }
 
-    #header { height: 1; background: $panel; padding: 0 1; }
+    #header { height: 1; padding: 0 1; }
     #heading { width: 1fr; }
     #progress { width: auto; color: $muted; padding: 0 2; }
     #header Button { margin-left: 1; }
 
     #body { height: 1fr; }
-    #questions { width: 30; background: $panel; padding: 1 0 0 0; }
+    #questions { width: 30; padding: 1 0 0 0; border-right: solid $divider; }
     #questions .caption { padding: 0 2; }
-    #question-list { height: 1fr; background: $panel; border: none; padding: 0 1; }
+    #question-list { height: 1fr; background: ansi_default; border: none; padding: 0 1; }
     #question-list > .option-list--option { padding: 0 1; }
-    #question-list > .option-list--option-highlighted { background: $raised; color: $strong; text-style: none; }
+    #question-list > .option-list--option-highlighted { background: $selection; color: $strong; text-style: none; }
     #question-list:focus > .option-list--option-highlighted { background: $accent-dim; }
     #question-list > .option-list--option-hover { background: $surface; }
 
     #center { width: 1fr; padding: 1 3 0 3; }
-    #discussion { width: 38%; background: $panel; padding: 1 2 0 2; }
+    #discussion { width: 38%; padding: 1 2 0 2; border-left: solid $divider; }
     .caption { height: 1; color: $muted; text-style: bold; }
     #question-scroll { height: 1fr; scrollbar-size-vertical: 1; }
     #question-meta { height: 1; color: $muted; }
@@ -314,12 +315,11 @@ class GrillApp(App):
                       background: $surface; border-left: outer $accent; }
     #choices { height: auto; max-height: 20; margin-top: 1; max-width: 96;
                background: $bg; border: none; padding: 0; }
-    #choices:focus { background: $bg; }
+    #choices, #choices:focus { background: ansi_default; }
     #choices > .option-list--option { padding: 0 1; }
-    #choices > .option-list--option-highlighted { background: $bg; text-style: none; }
+    #choices > .option-list--option-highlighted { background: ansi_default; text-style: none; }
     #choices:focus > .option-list--option-highlighted { background: $surface; }
     #choices > .option-list--option-hover { background: $surface; }
-    #choices > .option-list--separator { color: $bg; }
 
     .field-head { height: 1; margin-top: 1; }
     .field-head .caption { width: 1fr; }
@@ -334,6 +334,18 @@ class GrillApp(App):
 
     #discussion-head { height: 1; }
     #discussion-head .caption { width: 1fr; }
+    #agent-picker { height: auto; margin-top: 1; }
+    #agent-row { height: 1; }
+    #agent-row Select { width: 1fr; margin-right: 1; }
+    #agent-harness { max-width: 16; }
+    #agent-effort { max-width: 12; margin-right: 0; }
+    #agent-row SelectCurrent { background: $raised; color: $text; border: none; padding: 0 1; }
+    #agent-row Select:focus > SelectCurrent { background: $accent-dim; color: $strong; }
+    #agent-row SelectOverlay { background: $raised; border: tall $line-strong; }
+    #agent-custom { margin-top: 1; background: $raised; border: none; }
+    #agent-custom:focus { background: $accent-dim; }
+    #agent-chat { height: auto; margin-top: 1; }
+    #agent-note { width: 1fr; height: auto; color: $muted; }
     #chat-scroll { height: 1fr; margin-top: 1; scrollbar-size-vertical: 1; }
     .msg { height: auto; padding: 0 1; margin-bottom: 1; }
     .msg-user { background: $surface; border-left: outer $accent; }
@@ -348,15 +360,16 @@ class GrillApp(App):
              background: $surface; border-left: outer $ok; }
     #draft-buttons { margin-bottom: 1; }
 
-    #status { height: 1; padding: 0 1; background: $panel; color: $muted; }
+    #status { height: 1; padding: 0 1; color: $muted; }
     #status.-error { color: $err; }
-    Footer { background: $panel; }
-    Footer > FooterKey { background: $panel; color: $muted; }
-    Footer > FooterKey .footer-key--key { background: $panel; color: $accent; }
+    Footer, Footer > FooterKey, Footer > FooterKey .footer-key--key { background: ansi_default; }
+    Footer > FooterKey { color: $muted; }
+    Footer > FooterKey .footer-key--key { color: $accent; }
     Toast { background: $raised; }
     .narrow #progress { display: none; }
     .narrow #questions { width: 100%; }
     .narrow #center, .narrow #discussion { width: 100%; }
+    .narrow #questions, .narrow #discussion { border: none; }
     .narrow #center { padding: 1 1 0 1; }
     '''
 
@@ -364,7 +377,8 @@ class GrillApp(App):
         return {**super().get_css_variables(), **PALETTE}
 
     def __init__(self, session, client=None):
-        super().__init__(driver_class=CellMouseDriver)
+        # Native ANSI lets `ansi_default` keep the terminal's own (possibly transparent) background.
+        super().__init__(driver_class=CellMouseDriver, ansi_color=True)
         self.session = Path(session).resolve()
         self.client = client or Client(session)
         self.state = None
@@ -375,8 +389,13 @@ class GrillApp(App):
         self.chat_fingerprint = None
         self.compact_view = 'center'
         self.expanded_chat = False
+        # Wide-screen panels the owner hid with F2 / F7; they stay hidden across redraws.
+        self.hide_questions = False
+        self.hide_discussion = False
         self.pending_file = self.session / 'tui-pending.json'
         self.submit_notice = SUBMITTED
+        self.catalog = {'ready': False, 'harnesses': {}}
+        self.catalog_checked = time.monotonic()
 
     def compose(self) -> ComposeResult:
         with Horizontal(id='header'):
@@ -407,7 +426,7 @@ class GrillApp(App):
             with Vertical(id='discussion'):
                 with Horizontal(id='discussion-head'):
                     yield Label('Обсуждение', classes='caption')
-                    yield Button('Агент', id='agent', compact=True)
+                yield AgentPicker(id='agent-picker')
                 with VerticalScroll(id='chat-scroll'):
                     yield Static('', id='chat-empty')
                 yield Static('', id='chat-status', markup=False)
@@ -430,7 +449,10 @@ class GrillApp(App):
             return await asyncio.to_thread(self.client.request, path, data)
 
     def status(self, message, error=False):
-        line = self.query_one('#status', Static)
+        try:
+            line = self.query_one('#status', Static)
+        except NoMatches:
+            return  # A late timer during teardown; there is nowhere to report.
         line.set_class(error, '-error')
         line.update(message)
 
@@ -456,8 +478,12 @@ class GrillApp(App):
                 ('Grill', f"bold {PALETTE['accent']}"), ('  ·  ', PALETTE['faint']),
                 (self.state['round']['title'], f"bold {PALETTE['strong']}")))
             self.refresh_list()
+            await self.fetch_catalog()
             self.load_question()
             self.apply_layout()
+            # Start where the answer goes, never on a button that Enter would press.
+            choices = self.query_one('#choices', ChoiceList)
+            (choices if choices.display else self.query_one('#answer')).focus()
             self.set_interval(.6, self.tick)
             await self.tick()
         except (OSError, ValueError) as exc:
@@ -470,7 +496,7 @@ class GrillApp(App):
         try:
             from grill_herdr import notify_agent
             await asyncio.to_thread(notify_agent, self.session)
-            return AGENT_NOTIFIED
+            return AGENT_NOTIFIED.format(path=self.session / 'answers.json')
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             return f'Не удалось написать агенту: {exc}. ' + SUBMITTED
 
@@ -522,6 +548,7 @@ class GrillApp(App):
         self.query_one('#question-scroll').scroll_home(animate=False)
         self.chat_fingerprint = None
         self.refresh_chat()
+        self.sync_picker()
         self.refresh_controls()
 
     def refresh_controls(self):
@@ -533,9 +560,7 @@ class GrillApp(App):
         self.query_one('#summarize').disabled = submitted or running
         self.query_one('#stop').disabled = submitted or not running
         self.query_one('#return', Button).variant = 'success' if submitted else 'default'
-        agent = self.query_one('#agent', Button)
-        agent.label = label(self.chat_runtime()) + '  ▾'
-        agent.disabled = submitted or running
+        self.query_one('#agent-picker').disabled = submitted
         answer = self.state['answers'][self.q['id']]
         confirmed = answer['confirmed']
         self.query_one('#confirm', Button).label = 'Подтверждено ✓' if confirmed else 'Подтвердить ответ'
@@ -566,8 +591,15 @@ class GrillApp(App):
             scroll.call_after_refresh(scroll.scroll_end, animate=False)
         status = self.query_one('#chat-status', Static)
         status.set_class(bool(branch.get('error')), '-error')
-        status.update(branch.get('error') or (
-            'Агент отвечает… Можно перейти к другому вопросу.' if branch['status'] == 'running' else ''))
+        progress = ''
+        if branch['status'] == 'running':
+            runtime = self.chat_runtime()
+            agent = HARNESSES[runtime['harness']].label if runtime.get('harness') in HARNESSES else 'Агент'
+            elapsed = int(time.time() - branch['started_at']) if branch.get('started_at') else 0
+            progress = f'{agent} отвечает · {elapsed // 60}:{elapsed % 60:02d}'
+            if branch.get('activity'):
+                progress += ' · ' + branch['activity']
+        status.update(branch.get('error') or progress)
         summary = branch.get('summary', '')
         self.query_one('#draft', Static).update(summary)
         self.query_one('#draft').display = bool(summary)
@@ -599,12 +631,19 @@ class GrillApp(App):
                 self.state['branches'][qid]['input_draft'] = draft
             self.state['submitted'] = latest['submitted']
             self.state['runtime'] = latest['runtime']
+            if not self.catalog.get('ready') and time.monotonic() - self.catalog_checked > 5:
+                # The server lists models in the background; pick them up once ready.
+                self.catalog_checked = time.monotonic()
+                await self.fetch_catalog()
+                if self.catalog.get('ready'):
+                    self.sync_picker()
             self.refresh_chat()
             self.refresh_controls()
             if self.state['submitted']:
                 self.status(self.submit_notice)
             elif not self.dirty and not self.draft_dirty:
-                self.status('Сохранено. Когда ответите на все вопросы, нажмите «Отправить все ответы».')
+                self.status(ALL_CONFIRMED if all(a['confirmed'] for a in self.state['answers'].values())
+                            else 'Сохранено. Когда ответите на все вопросы, нажмите «Отправить все ответы».')
         except (OSError, ValueError) as exc:
             self.status(f'Нет сохранения на сервере: {exc}. Черновики сохранены локально; сообщения повторно не отправляются.',
                         error=True)
@@ -636,9 +675,41 @@ class GrillApp(App):
     @on(Composer.Submitted)
     async def composer_submitted(self, event):
         if event.composer.id == 'answer':
-            await self.action_confirm()
+            await self.confirm_and_advance()
         else:
             self.query_one('#send', Button).press()
+
+    @on(ChoiceList.Submitted)
+    async def choices_submitted(self, event):
+        await self.confirm_and_advance()
+
+    async def confirm_and_advance(self):
+        """Enter: confirm a non-empty answer and move to the next unconfirmed question."""
+        if not self.state or self.state['submitted']:
+            return
+        answer = self.state['answers'][self.q['id']]
+        if not answer['selected'] and not answer['text'].strip():
+            return  # Nothing chosen or written: Enter does nothing.
+        await self.action_confirm()
+        if not answer['confirmed']:
+            return
+        questions = self.state['round']['questions']
+        order = questions[self.index + 1:] + questions[:self.index]
+        pending = next((q for q in order if not self.state['answers'][q['id']]['confirmed']), None)
+        if pending is None:
+            self.query_one('#submit', Button).focus()
+            self.status(ALL_CONFIRMED)
+            return
+        self.show_question(questions.index(pending))
+        choices = self.query_one('#choices', ChoiceList)
+        (choices if choices.display else self.query_one('#answer')).focus()
+
+    def show_question(self, index):
+        self.index = index
+        self.load_question()
+        self.query_one('#question-list', OptionList).highlighted = index
+        self.compact_view = 'center'
+        self.apply_layout()
 
     @on(ChoiceList.Toggled)
     def selected(self, event):
@@ -659,10 +730,7 @@ class GrillApp(App):
             await self.flush()
         except (OSError, ValueError) as exc:
             self.status(f'Черновик сохранён локально: {exc}', error=True)
-        self.index = event.option_index
-        self.load_question()
-        self.compact_view = 'center'
-        self.apply_layout()
+        self.show_question(event.option_index)
 
     async def action_confirm(self):
         if not self.state or self.state['submitted']:
@@ -712,6 +780,13 @@ class GrillApp(App):
                 self.status(self.submit_notice)
                 self.notify(self.submit_notice, title='Ответы отправлены', timeout=30)
                 self.query_one('#return', Button).focus()
+                if (self.session / 'herdr.json').exists():
+                    # The round is read-only now and the agent is already working: go there.
+                    try:
+                        from grill_herdr import return_to_agent
+                        await asyncio.to_thread(return_to_agent, self.session)
+                    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                        self.status(f'{self.submit_notice} Не удалось переключиться на агента: {exc}', error=True)
             elif ident in ('send', 'summarize'):
                 await self.flush()
                 qid = self.q['id']
@@ -740,33 +815,43 @@ class GrillApp(App):
         except (OSError, ValueError) as exc:
             self.status(f'Действие не подтверждено: {exc}. Проверьте состояние перед повторной отправкой.', error=True)
 
-    async def action_agent(self):
-        if not self.state or self.state['submitted']:
-            return
-        branch = self.state['branches'][self.q['id']]
-        if branch['status'] == 'running':
-            self.status('Дождитесь ответа или остановите обсуждение.')
-            return
-        qid = self.q['id']
+    async def fetch_catalog(self):
         try:
-            catalog = await self.api('/api/catalog')
+            self.catalog = await self.api('/api/catalog')
         except (OSError, ValueError) as exc:
             self.status(f'Список моделей недоступен: {exc}', error=True)
-            catalog = {'ready': False, 'harnesses': {}}
+
+    def sync_picker(self):
+        branch = self.state['branches'][self.q['id']]
         chat = branch['runtime'] if branch.get('thread_id') else None
         parent = self.state.get('parent_runtime', self.state['runtime'])
+        self.query_one('#agent-picker', AgentPicker).load(self.catalog, self.state['runtime'], parent, chat)
 
-        async def chosen(result):
-            if not result:
-                return
-            try:
-                await self.api('/api/runtime', {'question_id': qid, **result})
-                await self.tick()
-                self.load_question()
-                self.status('Агент для новых чатов: ' + label(self.state['runtime']))
-            except (OSError, ValueError) as exc:
-                self.status(f'Настройки не применены: {exc}', error=True)
-        self.push_screen(AgentScreen(catalog, self.state['runtime'], parent, chat), chosen)
+    async def action_agent(self):
+        """F5: move to the agent controls of the discussion panel."""
+        self.compact_view = 'discussion'
+        self.hide_discussion = False
+        self.expanded_chat = False
+        self.apply_layout()
+        self.query_one('#agent-harness', Select).focus()
+
+    @on(AgentPicker.Changed)
+    async def agent_changed(self, event):
+        if not self.state or self.state['submitted']:
+            return
+        try:
+            await self.api('/api/runtime', {'question_id': self.q['id'], 'runtime': event.runtime,
+                                            'restart': event.restart})
+            await self.tick()
+            if event.restart:
+                self.chat_fingerprint = None
+                self.refresh_chat()
+            self.sync_picker()
+            self.status(('Чат начат заново. ' if event.restart else '') +
+                        'Агент для новых чатов: ' + label(self.state['runtime']))
+        except (OSError, ValueError) as exc:
+            self.sync_picker()
+            self.status(f'Настройки не применены: {exc}', error=True)
 
     def action_answer_field(self):
         self.compact_view = 'center'
@@ -779,20 +864,28 @@ class GrillApp(App):
 
     def action_message_field(self):
         self.compact_view = 'discussion'
+        self.hide_discussion = False
         self.apply_layout()
         self.query_one('#message').focus()
 
     def action_questions(self):
         self.compact_view = 'center' if self.compact_view == 'questions' else 'questions'
-        if self.size.width >= 110:
-            self.query_one('#questions').display = not self.query_one('#questions').display
+        self.hide_questions = not self.hide_questions
+        self.apply_layout()
+
+    def action_toggle_discussion(self):
+        if self.size.width < 110:
+            self.compact_view = 'center' if self.compact_view == 'discussion' else 'discussion'
         else:
-            self.apply_layout()
+            self.hide_discussion = not self.hide_discussion
+            self.expanded_chat = False
+        self.apply_layout()
 
     def action_discussion(self):
         self.compact_view = 'center' if self.compact_view == 'discussion' else 'discussion'
         if self.size.width >= 110:
             self.expanded_chat = not self.expanded_chat
+            self.hide_discussion = False
         self.apply_layout()
 
     def on_resize(self):
@@ -805,9 +898,10 @@ class GrillApp(App):
         # Wide screens show every column; the view toggles only matter when narrow.
         for ident in ('toggle-questions', 'toggle-chat'):
             self.query_one('#' + ident).display = narrow
+        hidden = {'questions': self.hide_questions, 'center': False, 'discussion': self.hide_discussion}
         for name in ('questions', 'center', 'discussion'):
             self.query_one('#' + name).display = name == self.compact_view if narrow else (
-                name == 'discussion' if self.expanded_chat else True)
+                name == 'discussion' if self.expanded_chat else not hidden[name])
         self.query_one('#discussion').styles.width = '100%' if self.expanded_chat or narrow else '34%'
 
     async def action_leave(self):

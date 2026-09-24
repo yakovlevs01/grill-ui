@@ -26,6 +26,11 @@ def require(value, message):
         raise ValueError(message)
 
 
+def short(text, limit=60):
+    text = ' '.join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1] + '…'
+
+
 def output_of(argv, timeout=20):
     try:
         result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
@@ -44,6 +49,10 @@ class Harness:
 
     def env(self):
         return {k: v for k, v in os.environ.items() if k not in PARENT_ENV}
+
+    def activity(self, event):
+        """A short phrase for what the agent is doing now, or None."""
+        return None
 
     def entry(self, models, efforts):
         return {'id': self.id, 'label': self.label, 'available': self.available(),
@@ -107,6 +116,22 @@ class Codex(Harness):
         if session:
             cmd += ['resume', session]
         return cmd + ['--skip-git-repo-check', '--json', '-']
+
+    def activity(self, event):
+        kind, item = event.get('type'), event.get('item') or {}
+        if kind == 'turn.started':
+            return 'думает'
+        if kind != 'item.started' and not (kind == 'item.completed' and item.get('type') == 'agent_message'):
+            return None
+        kind = item.get('type')
+        if kind == 'command_execution':
+            # Codex wraps commands as `<shell> -lc "<command>"`; show the command itself.
+            command = str(item.get('command', ''))
+            inner = re.search(r'-lc\s+([\'"])(.*)\1\s*$', command, re.S)
+            return 'выполняет ' + short(inner.group(2) if inner else command)
+        return {'reasoning': 'думает', 'file_change': 'меняет файлы', 'web_search': 'ищет в интернете',
+                'mcp_tool_call': 'вызывает ' + short(item.get('tool', 'инструмент'), 40),
+                'agent_message': 'пишет ответ'}.get(kind)
 
     def parse(self, event):
         """Return (session ID, assistant text, failure) found in one event."""
@@ -172,6 +197,29 @@ class Claude(Harness):
         if session:
             cmd += ['--resume', session]
         return cmd
+
+    def activity(self, event):
+        if event.get('type') != 'assistant':
+            return None
+        blocks = (event.get('message') or {}).get('content') or []
+        found = None
+        for block in blocks if isinstance(blocks, list) else []:
+            kind = block.get('type') if isinstance(block, dict) else None
+            if kind == 'tool_use':
+                name, args = block.get('name', ''), block.get('input') or {}
+                if name == 'Read':
+                    found = 'читает ' + short(Path(str(args.get('file_path', ''))).name or 'файл', 50)
+                elif name == 'Grep':
+                    found = 'ищет «' + short(args.get('pattern', ''), 40) + '»'
+                elif name == 'Glob':
+                    found = 'ищет файлы ' + short(args.get('pattern', ''), 40)
+                else:
+                    found = 'вызывает ' + short(name, 40)
+            elif kind == 'thinking':
+                found = 'думает'
+            elif kind == 'text':
+                found = 'пишет ответ'
+        return found
 
     def parse(self, event):
         kind = event.get('type')

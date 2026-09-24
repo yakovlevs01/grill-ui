@@ -5,9 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from textual.widgets import Button, Checkbox, Input, Select, TextArea
+from textual.widgets import Button, Input, Select, TextArea
 import grill_ui as g
-from grill_tui import AgentScreen, ChoiceList, GrillApp, CUSTOM
+from grill_tui import ChoiceList, GrillApp, CUSTOM
 import test_grill_ui
 
 CATALOG = {'ready': True, 'harnesses': {
@@ -69,49 +69,40 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         app = GrillApp(self.fixture.root, self.api)
         async with app.run_test(size=(150, 45)) as pilot:
             await pilot.pause()
-            self.assertIn('Codex · test-model · high', str(app.query_one('#agent').label))
+            harness, model, effort = (app.query_one(f'#agent-{n}', Select) for n in ('harness', 'model', 'effort'))
+            self.assertEqual((harness.value, model.value, effort.value), ('codex', 'test-model', 'high'))
+            self.assertFalse(app.query_one('#agent-chat').display)
             await pilot.press('f5')
             await pilot.pause()
-            screen = app.screen
-            self.assertIsInstance(screen, AgentScreen)
-            self.assertEqual(len(screen.query(Checkbox)), 0)
-            screen.query_one('#agent-harness', Select).value = 'claude'
+            self.assertIs(app.focused, harness)
+            harness.value = 'claude'
             await pilot.pause()
-            self.assertEqual(screen.query_one('#agent-model', Select).value, 'opus')
-            self.assertEqual(screen.query_one('#agent-effort', Select).value, 'high')
+            self.assertEqual((model.value, effort.value), ('opus', 'high'))
+            self.assertEqual(self.store.state['runtime']['model'], 'opus')
             # A model newer than the catalog is typed in by hand.
-            screen.query_one('#agent-model', Select).value = CUSTOM
+            model.value = CUSTOM
             await pilot.pause()
-            self.assertTrue(screen.query_one('#agent-custom').display)
-            screen.query_one('#agent-custom', Input).value = 'claude-future-9'
-            screen.query_one('#agent-effort', Select).value = 'max'
-            await pilot.click('#agent-apply')
+            self.assertTrue(app.query_one('#agent-custom').display)
+            self.assertEqual(self.store.state['runtime']['model'], 'opus')
+            app.query_one('#agent-custom', Input).value = 'claude-future-9'
+            effort.value = 'max'
             await pilot.pause()
-            self.assertNotIsInstance(app.screen, AgentScreen)
             runtime = self.store.state['runtime']
             self.assertEqual((runtime['harness'], runtime['model'], runtime['effort']), ('claude', 'claude-future-9', 'max'))
-            self.assertIn('Claude Code · claude-future-9 · max', str(app.query_one('#agent').label))
             # A started chat keeps its agent until the owner restarts it.
             listing = app.query_one('#question-list')
             listing.focus()
             await pilot.press('down', 'enter')
             await pilot.pause()
-            self.assertIn('Codex · test-model · high', str(app.query_one('#agent').label))
-            await pilot.click('#agent')
-            await pilot.pause()
-            screen = app.screen
-            self.assertEqual(screen.query_one('#agent-harness', Select).value, 'claude')
-            await pilot.click('#agent-cancel')
-            await pilot.pause()
+            self.assertTrue(app.query_one('#agent-chat').display)
+            self.assertIn('Codex · test-model · high', str(app.query_one('#agent-note').render()))
+            self.assertEqual(harness.value, 'claude')
             self.assertEqual(self.store.state['branches']['Q2']['thread_id'], 'codex-thread')
-            await pilot.press('f5')
-            await pilot.pause()
-            app.screen.query_one('#agent-restart', Checkbox).value = True
-            await pilot.click('#agent-apply')
+            await pilot.click('#agent-restart')
             await pilot.pause()
             branch = self.store.state['branches']['Q2']
             self.assertEqual((branch['thread_id'], branch['messages']), (None, []))
-            self.assertIn('Claude Code · claude-future-9 · max', str(app.query_one('#agent').label))
+            self.assertFalse(app.query_one('#agent-chat').display)
 
     async def test_round_clicks_multiline_chat_and_submit(self):
         app = GrillApp(self.fixture.root, self.api)
@@ -173,26 +164,59 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.query_one('#message', TextArea).text, 'Чат')
             await pilot.press('f5')
             await pilot.pause()
-            self.assertIsInstance(app.screen, AgentScreen)
-            await pilot.press('f2', 'f3', 'f4', 'f5', 'f6')
+            self.assertIs(app.focused, app.query_one('#agent-harness', Select))
+            await pilot.press('f6')
             await pilot.pause()
-            self.assertIsInstance(app.screen, AgentScreen)
+            self.assertIs(app.focused, app.query_one('#message', TextArea))
 
-    async def test_enter_confirms_answer_and_sends_message(self):
+    async def test_enter_confirms_advances_and_sends_message(self):
         app = GrillApp(self.fixture.root, self.api)
         async with app.run_test(size=(150, 45)) as pilot:
             await pilot.pause()
-            await pilot.press('f4', 'Д', 'а', 'enter')
+            await pilot.press('f4', 'enter')
+            await pilot.pause()
+            self.assertEqual((app.q['id'], self.store.state['answers']['Q1']['confirmed']), ('Q1', False))
+            await pilot.press('Д', 'а', 'enter')
             await pilot.pause()
             self.assertEqual(self.store.state['answers']['Q1'], {'selected': [], 'text': 'Да', 'confirmed': True})
+            self.assertEqual(app.q['id'], 'Q2')
+            self.assertIs(app.focused, app.query_one('#choices'))
+            await pilot.press('enter')  # Nothing chosen yet: Enter does nothing.
+            await pilot.pause()
+            self.assertEqual((app.q['id'], self.store.state['answers']['Q2']['confirmed']), ('Q2', False))
+            await pilot.press('space', 'enter')
+            await pilot.pause()
+            self.assertEqual(self.store.state['answers']['Q2'], {'selected': ['title'], 'text': '', 'confirmed': True})
+            self.assertEqual(app.q['id'], 'Q3')
             self.assertIs(app.focused, app.query_one('#answer'))
+            await pilot.press('shift+enter', 'О', 'К', 'enter')
+            await pilot.pause()
+            self.assertEqual(self.store.state['answers']['Q3'], {'selected': [], 'text': '\nОК', 'confirmed': True})
+            self.assertIs(app.focused, app.query_one('#submit'))
             await pilot.press('f6', 'В', 'о', 'п', 'р', 'о', 'с', 'enter')
             await pilot.pause()
-            messages = self.store.state['branches']['Q1']['messages']
+            messages = self.store.state['branches']['Q3']['messages']
             self.assertEqual(messages[0], {'role': 'user', 'text': 'Вопрос'})
             self.assertEqual(app.query_one('#message', TextArea).text, '')
             self.assertEqual(len(app.query('.msg')), 2)
             self.assertEqual(len(app.query('.msg-user')), 1)
+
+    async def test_f2_and_f7_hide_panels_until_pressed_again(self):
+        app = GrillApp(self.fixture.root, self.api)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause()
+            await pilot.press('f2', 'f7')
+            await pilot.pause()
+            app.apply_layout()  # Any redraw must keep the owner's choice.
+            self.assertFalse(app.query_one('#questions').display)
+            self.assertFalse(app.query_one('#discussion').display)
+            self.assertTrue(app.query_one('#center').display)
+            await pilot.press('f6')
+            await pilot.pause()
+            self.assertTrue(app.query_one('#discussion').display)
+            await pilot.press('f2')
+            await pilot.pause()
+            self.assertTrue(app.query_one('#questions').display)
 
     async def test_submit_types_notice_into_agent_pane(self):
         import grill_herdr
@@ -203,12 +227,14 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                                  (ValueError('Original agent terminal is gone'), 'Не удалось написать агенту')):
             self.store.state['submitted'] = False
             app = GrillApp(self.fixture.root, self.api)
-            with patch.object(grill_herdr, 'notify_agent', side_effect=effect) as notify:
+            with patch.object(grill_herdr, 'notify_agent', side_effect=effect) as notify, \
+                 patch.object(grill_herdr, 'return_to_agent') as back:
                 async with app.run_test(size=(150, 45)) as pilot:
                     await pilot.pause()
                     await pilot.click('#submit')
                     await pilot.pause()
                     notify.assert_called_once_with(self.fixture.root.resolve())
+                    back.assert_called_once_with(self.fixture.root.resolve())
                     self.assertIn(expected, app.submit_notice)
                     self.assertIs(app.focused, app.query_one('#return', Button))
 

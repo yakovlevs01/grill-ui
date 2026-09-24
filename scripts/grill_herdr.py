@@ -209,10 +209,15 @@ def return_to_agent(session):
     herdr(['tab', 'focus', pane['tab_id']], env)
 
 
+def submit_notice(session):
+    # The path lets the owner open the exact file the agent is about to read.
+    return f'{SUBMIT_NOTICE}. Файл: {Path(session).resolve() / "answers.json"}'
+
+
 def notify_agent(session):
     """Type the submit notice into the agent's input, after any text already there."""
     pane, env = agent_pane(session)
-    herdr(['pane', 'send-text', pane['pane_id'], SUBMIT_NOTICE], env)
+    herdr(['pane', 'send-text', pane['pane_id'], submit_notice(session)], env)
     # A separate Enter keeps agent TUIs from folding it into the text as a pasted newline.
     time.sleep(.2)
     herdr(['pane', 'send-keys', pane['pane_id'], 'enter'], env)

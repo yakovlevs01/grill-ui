@@ -56,7 +56,8 @@ class OwnershipTests(unittest.TestCase):
             with patch.object(h, 'owner_env', return_value={}), patch.object(h, 'herdr', fake), \
                  patch.object(h.time, 'sleep'):
                 h.notify_agent(tmp)
-                self.assertEqual(calls[1:], [['pane', 'send-text', 'w1:p1', h.SUBMIT_NOTICE],
+                notice = h.SUBMIT_NOTICE + '. Файл: ' + str(Path(tmp).resolve() / 'answers.json')
+                self.assertEqual(calls[1:], [['pane', 'send-text', 'w1:p1', notice],
                                              ['pane', 'send-keys', 'w1:p1', 'enter']])
                 pane['terminal_id'] = 'term-b'
                 calls.clear()

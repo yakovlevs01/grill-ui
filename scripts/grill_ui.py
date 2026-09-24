@@ -200,7 +200,7 @@ class Store:
             harness = HARNESSES[branch['runtime']['harness']]
             require(harness.available(), f'{harness.label} CLI is not installed')
             branch['messages'].append({'role': 'user', 'text': message})
-            branch.update(status='running', error=None)
+            branch.update(status='running', error=None, started_at=time.time(), activity='запускается')
             if not summarize:
                 branch['summary'] = ''
             self.cancelled.discard(qid)
@@ -267,7 +267,10 @@ class Store:
                         if not isinstance(event, dict):
                             continue
                         thread, text, failed = harness.parse(event)
+                        activity = harness.activity(event)
                         with self.lock:
+                            if activity:
+                                branch['activity'] = activity
                             if thread and thread != branch['thread_id']:
                                 branch['thread_id'] = thread
                                 self.save()
@@ -305,7 +308,7 @@ class Store:
                         branch['summary'] = response
                 if qid in self.cancelled:
                     failure = 'Обсуждение остановлено. Можно отправить новое сообщение.'
-                branch.update(status='error' if failure else 'idle', error=failure)
+                branch.update(status='error' if failure else 'idle', error=failure, activity='', started_at=None)
                 self.save()
 
     def stop(self, qid):
@@ -366,12 +369,7 @@ def serve(args):
 
         def do_GET(self):
             try:
-                if self.path in ('/', '/app.js', '/style.css'):
-                    name, mime = {'/': ('index.html', 'text/html; charset=utf-8'),
-                        '/app.js': ('app.js', 'text/javascript; charset=utf-8'),
-                        '/style.css': ('style.css', 'text/css; charset=utf-8')}[self.path]
-                    self.respond(200, (ASSETS / name).read_bytes(), mime)
-                elif self.path == '/api/health':
+                if self.path == '/api/health':
                     self.authorized()
                     self.respond(200, {'instance': instance, 'session': str(store.path)})
                 elif self.path == '/api/state':

@@ -200,6 +200,20 @@ print(json.dumps({'models': [
             proc.send_signal(signal.SIGTERM)
             proc.communicate(timeout=5)
 
+    def test_activity_phrases_from_cli_events(self):
+        codex, claude = harness.HARNESSES['codex'], harness.HARNESSES['claude']
+        started = {'type': 'item.started', 'item': {'type': 'command_execution',
+                   'command': '/usr/bin/zsh -lc "rg -c \'^##\' SKILL.md"', 'status': 'in_progress'}}
+        self.assertEqual(codex.activity(started), "выполняет rg -c '^##' SKILL.md")
+        self.assertEqual(codex.activity({'type': 'turn.started'}), 'думает')
+        self.assertEqual(codex.activity({'type': 'item.completed', 'item': {'type': 'agent_message'}}), 'пишет ответ')
+        self.assertIsNone(codex.activity({'type': 'thread.started'}))
+        read = {'type': 'assistant', 'message': {'content': [
+            {'type': 'text', 'text': 'Сейчас посмотрю'},
+            {'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/repo/scripts/grill_tui.py'}}]}}
+        self.assertEqual(claude.activity(read), 'читает grill_tui.py')
+        self.assertIsNone(claude.activity({'type': 'result'}))
+
     def test_transport_multiturn_and_failure(self):
         # A fake CLI checks real argv/stdin and persisted branch identity.
         cli = self.root / 'codex'

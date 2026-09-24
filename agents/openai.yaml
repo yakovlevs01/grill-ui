@@ -1,4 +1,4 @@
 interface:
   display_name: "Grill UI"
-  short_description: "Вопросы в tab Herdr или HTML с отдельными чатами"
-  default_prompt: "Используй $grill-ui, чтобы согласовать решения по задаче в отдельном tab Herdr с чатами по вопросам; вне Herdr используй HTML."
+  short_description: "Вопросы во вкладке Herdr с отдельными чатами"
+  default_prompt: "Используй $grill-ui, чтобы согласовать решения по задаче в отдельном tab Herdr с чатами по вопросам; вне Herdr владелец открывает TUI в своём терминале."
