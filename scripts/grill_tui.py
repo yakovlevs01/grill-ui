@@ -7,19 +7,28 @@ import fcntl
 import json
 import subprocess
 from pathlib import Path
+from rich.table import Table
 from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.drivers.linux_driver import LinuxDriver
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
+from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, Footer, Input, Label, OptionList, Select, SelectionList, Static, TextArea
+from textual.widgets import Button, Checkbox, Footer, Input, Label, OptionList, Select, Static, TextArea
 from grill_client import Client
 from grill_harness import HARNESSES, label
 from grill_ui import read, write
 
 CUSTOM = '__custom__'
+# The owner's terminal theme (2026 Dark): one gray family, one accent, status colors only for state.
+PALETTE = {'bg': '#121314', 'panel': '#161718', 'surface': '#1c1d1f', 'raised': '#232527',
+           'line': '#2a2b2c', 'line-strong': '#3a3d41', 'text': '#bbbebf', 'strong': '#e2e5e7',
+           'muted': '#8b949e', 'faint': '#5c636b', 'accent': '#79c0ff', 'accent-dim': '#1d3a57',
+           'ok': '#7ee787', 'warn': '#cd9731', 'err': '#ff7b72'}
+MODES = {'single': 'Один вариант', 'multiple': 'Несколько вариантов', 'text': 'Свободный ответ'}
 SUBMITTED = 'Все ответы отправлены. Нажмите «К агенту» и напишите агенту «Готово».'
 AGENT_NOTIFIED = 'Все ответы отправлены, агент получил «Готово». Нажмите «К агенту».'
 
@@ -36,21 +45,117 @@ class CellMouseDriver(LinuxDriver):
         self.flush()
 
 
+class Composer(TextArea):
+    """Enter submits; Shift+Enter or Ctrl+J inserts a line break."""
+
+    class Submitted(Message):
+        def __init__(self, composer):
+            super().__init__()
+            self.composer = composer
+
+    async def _on_key(self, event):
+        if event.key == 'enter':
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.Submitted(self))
+            return
+        if event.key in ('shift+enter', 'ctrl+j', 'alt+enter'):
+            event.stop()
+            event.prevent_default()
+            self.insert('\n')
+            return
+        await super()._on_key(event)
+
+
+class ChoiceList(OptionList):
+    """Options with the description under the label; SelectionList shows one line only."""
+    BINDINGS = [Binding('space', 'select', 'Выбрать', show=False)]
+
+    class Toggled(Message):
+        def __init__(self, choices):
+            super().__init__()
+            self.choices = choices
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.choices, self.mode, self.selected = [], 'single', []
+
+    def load(self, options, selected, mode):
+        self.choices, self.mode, self.selected = options, mode, list(selected)
+        self.redraw(0)
+
+    def redraw(self, highlighted=None):
+        highlighted = self.highlighted if highlighted is None else highlighted
+        self.clear_options()
+        for index, o in enumerate(self.choices):
+            if index:
+                self.add_option(None)  # A blank separator between options.
+            chosen = o['id'] in self.selected
+            if self.mode == 'multiple':
+                mark = '■' if chosen else '□'
+            else:
+                mark = '●' if chosen else '○'
+            text = Text()
+            text.append(o['label'], style=f"bold {PALETTE['accent' if chosen else 'strong']}")
+            if o.get('description'):
+                text.append('\n' + o['description'], style=PALETTE['muted'])
+            row = Table.grid(padding=(0, 1))
+            row.add_column(width=1)
+            row.add_column(ratio=1)
+            row.add_row(Text(mark, style=PALETTE['accent' if chosen else 'faint']), text)
+            self.add_option(row)
+        if self.choices:
+            self.highlighted = min(highlighted or 0, len(self.choices) - 1)
+
+    @on(OptionList.OptionSelected)
+    def toggle(self, event):
+        event.stop()
+        # Separators are not options, so option_index already skips them.
+        value = self.choices[event.option_index]['id']
+        if value in self.selected:
+            self.selected.remove(value)
+        elif self.mode == 'multiple':
+            self.selected.append(value)
+        else:
+            self.selected = [value]
+        # Keep the owner's order stable: the round's option order, not click order.
+        self.selected = [o['id'] for o in self.choices if o['id'] in self.selected]
+        self.redraw()
+        self.post_message(self.Toggled(self))
+
+
+def chat_message(role, text, author):
+    """One chat turn: author line, then the text, framed by role."""
+    color = PALETTE['accent'] if role == 'user' else PALETTE['strong']
+    body = Text.assemble((author, f'bold {color}'), '\n', text)
+    return Static(body, classes='msg ' + ('msg-user' if role == 'user' else 'msg-agent'))
+
+
 class AgentScreen(ModalScreen):
     """Harness, model and effort for new chats. Lists come from the installed CLIs."""
     BINDINGS = [('escape', 'cancel', 'Отмена')]
     CSS = '''
-    AgentScreen { align: center middle; }
-    #agent-box { width: 68; max-width: 100%; height: auto; max-height: 100%;
-                 padding: 0 2 1 2; background: #192631; border: solid #80c8bc; }
-    #agent-box Label { margin-top: 1; color: #80c8bc; text-style: bold; }
+    AgentScreen { align: center middle; background: $bg 60%; }
+    #agent-box { width: 64; max-width: 100%; height: auto; max-height: 100%;
+                 padding: 1 3; background: $surface; border: tall $line-strong; }
+    #agent-title { color: $strong; text-style: bold; }
+    #agent-box Label { margin-top: 1; color: $muted; }
     #agent-box Select, #agent-box Input { width: 100%; }
+    #agent-box Select, #agent-box Select:focus { border: none; }
+    #agent-box SelectCurrent { border: tall $raised; background: $raised; }
+    #agent-box Select:focus > SelectCurrent { border: tall $accent; }
+    #agent-box SelectOverlay { border: tall $line-strong; background: $raised; }
+    #agent-box Input { border: tall $raised; background: $raised; }
+    #agent-box Input:focus { border: tall $accent; }
+    #agent-box Checkbox { border: none; background: $surface; padding: 0; }
+    #agent-box Checkbox > .toggle--button { color: $raised; background: $raised; }
+    #agent-box Checkbox.-on > .toggle--button { color: $bg; background: $accent; }
     #agent-custom { margin-top: 1; }
     #agent-restart { margin-top: 1; }
-    #agent-note { height: auto; color: #acbac5; margin-top: 1; }
-    #agent-error { height: auto; color: #e1bd80; }
-    #agent-buttons { height: auto; margin-top: 1; }
-    #agent-buttons Button { width: 1fr; }
+    #agent-note { height: auto; color: $muted; margin-top: 1; }
+    #agent-error { height: auto; color: $err; }
+    #agent-buttons { height: auto; margin-top: 1; align-horizontal: right; }
+    #agent-buttons Button { margin-left: 2; }
     '''
 
     def __init__(self, catalog, current, parent, chat):
@@ -82,20 +187,21 @@ class AgentScreen(ModalScreen):
                      or [(e['label'], hid) for hid, e in self.harnesses.items()])
         hid = self.current['harness'] if self.harnesses.get(self.current['harness'], {}).get('available') else available[0][1]
         with Vertical(id='agent-box'):
-            yield Label('ХАРНЕСС')
+            yield Static('Агент для новых чатов', id='agent-title')
+            yield Label('Харнесс')
             yield Select(available, allow_blank=False, value=hid, id='agent-harness')
-            yield Label('МОДЕЛЬ')
+            yield Label('Модель')
             yield Select([('…', CUSTOM)], allow_blank=False, id='agent-model')
             yield Input(placeholder='ID модели, как его принимает CLI', id='agent-custom')
-            yield Label('EFFORT')
+            yield Label('Effort')
             yield Select([('…', '')], allow_blank=False, id='agent-effort')
             if self.chat:
                 yield Checkbox('Начать чат этого вопроса заново', id='agent-restart')
             yield Static(self.note(), id='agent-note', markup=False)
             yield Static('', id='agent-error', markup=False)
             with Horizontal(id='agent-buttons'):
-                yield Button('Применить', id='agent-apply', variant='primary')
-                yield Button('Отмена', id='agent-cancel')
+                yield Button('Отмена', id='agent-cancel', compact=True)
+                yield Button('Применить', id='agent-apply', variant='primary', compact=True)
 
     def note(self):
         lines = ['Применяется к новым чатам.']
@@ -165,47 +271,97 @@ class AgentScreen(ModalScreen):
 class GrillApp(App):
     TITLE = 'Grill'
     ENABLE_COMMAND_PALETTE = False
-    BINDINGS = [('f2', 'questions', 'Вопросы'), ('f3', 'discussion', 'Чат'),
-                ('f4', 'answer_field', 'Ответ'), ('f5', 'agent', 'Агент'), ('f6', 'message_field', 'Сообщение'),
+    # Priority: TextArea binds F6 to select_line, so typing after F6 replaced the answer line.
+    BINDINGS = [Binding('f2', 'questions', 'Вопросы', priority=True),
+                Binding('f3', 'discussion', 'Чат', priority=True),
+                Binding('f4', 'answer_field', 'Ответ', priority=True),
+                Binding('f5', 'agent', 'Агент', priority=True),
+                Binding('f6', 'message_field', 'Сообщение', priority=True),
                 ('ctrl+s', 'confirm', 'Подтвердить'), ('ctrl+q', 'leave', 'Выйти')]
     CSS = '''
-    Screen { background: #111923; color: #e4e9ed; }
-    #heading { height: 2; padding: 0 1; background: #1d2c3b; text-style: bold; }
-    #toolbar { height: 3; }
-    #toolbar Button { min-width: 12; margin-right: 1; }
+    Screen { background: $bg; color: $text; }
+    Button { border: none; height: 1; min-width: 0; padding: 0 2;
+             background: $raised; color: $text; text-style: none; }
+    Button:hover { background: $line-strong; color: $strong; }
+    Button:focus { background: $accent-dim; color: $strong; text-style: bold; }
+    Button.-primary, Button.-success { background: $accent; color: $bg; text-style: bold; }
+    Button.-primary:hover, Button.-success:hover { background: $strong; color: $bg; }
+    Button.-primary:focus, Button.-success:focus { background: $strong; color: $bg; }
+    Button:disabled { background: $surface; color: $faint; text-style: none; }
+
+    #header { height: 1; background: $panel; padding: 0 1; }
+    #heading { width: 1fr; }
+    #progress { width: auto; color: $muted; padding: 0 2; }
+    #header Button { margin-left: 1; }
+
     #body { height: 1fr; }
-    #questions { width: 23%; min-width: 19; border-right: solid #344857; padding: 0 1; }
-    #question-list { height: 1fr; background: #111923; }
-    #center { width: 43%; padding: 0 1; }
-    #discussion { width: 34%; border-left: solid #344857; padding: 0 1; }
-    .caption { height: 1; color: #80c8bc; text-style: bold; margin-top: 1; }
-    #question-scroll { height: 1fr; }
-    #question-text { height: auto; margin-bottom: 1; }
-    #recommendation { height: auto; color: #9dcfc4; margin-bottom: 1; }
-    #choices { height: auto; max-height: 14; background: #192631; }
-    #choices > .selection-list--button, #choices > .selection-list--button-highlighted {
-        color: #344857; background: #344857;
-    }
-    #choices > .selection-list--button-selected, #choices > .selection-list--button-selected-highlighted {
-        color: #80c8bc; background: #344857;
-    }
-    #option-details { height: auto; color: #acbac5; margin-top: 1; }
-    TextArea { height: 7; border: solid #344857; background: #192631; }
-    TextArea:focus { border: solid #80c8bc; }
-    #answer { height: 8; }
-    #confirm { width: 100%; }
-    #chat-scroll { height: 1fr; }
-    #chat-log { height: auto; }
-    #chat-status { height: auto; max-height: 5; color: #e1bd80; }
-    #chat-buttons, #draft-buttons { height: auto; min-height: 3; }
-    #discussion Button { min-width: 8; width: 1fr; }
-    #agent { width: 100%; height: 3; }
-    #draft { height: auto; max-height: 8; color: #9dcfc4; }
-    #status { height: auto; min-height: 1; max-height: 3; padding: 0 1; background: #1d2c3b; }
-    #submit { min-width: 25; }
+    #questions { width: 30; background: $panel; padding: 1 0 0 0; }
+    #questions .caption { padding: 0 2; }
+    #question-list { height: 1fr; background: $panel; border: none; padding: 0 1; }
+    #question-list > .option-list--option { padding: 0 1; }
+    #question-list > .option-list--option-highlighted { background: $raised; color: $strong; text-style: none; }
+    #question-list:focus > .option-list--option-highlighted { background: $accent-dim; }
+    #question-list > .option-list--option-hover { background: $surface; }
+
+    #center { width: 1fr; padding: 1 3 0 3; }
+    #discussion { width: 38%; background: $panel; padding: 1 2 0 2; }
+    .caption { height: 1; color: $muted; text-style: bold; }
+    #question-scroll { height: 1fr; scrollbar-size-vertical: 1; }
+    #question-meta { height: 1; color: $muted; }
+    #question-title { height: auto; color: $strong; text-style: bold; margin: 1 0 1 0; }
+    #question-body { height: auto; max-width: 96; }
+    #recommendation { height: auto; max-width: 96; margin-top: 1; padding: 0 1;
+                      background: $surface; border-left: outer $accent; }
+    #choices { height: auto; max-height: 20; margin-top: 1; max-width: 96;
+               background: $bg; border: none; padding: 0; }
+    #choices:focus { background: $bg; }
+    #choices > .option-list--option { padding: 0 1; }
+    #choices > .option-list--option-highlighted { background: $bg; text-style: none; }
+    #choices:focus > .option-list--option-highlighted { background: $surface; }
+    #choices > .option-list--option-hover { background: $surface; }
+    #choices > .option-list--separator { color: $bg; }
+
+    .field-head { height: 1; margin-top: 1; }
+    .field-head .caption { width: 1fr; }
+    .hint { width: auto; color: $faint; }
+    TextArea { height: 6; background: $surface; border: tall $surface; padding: 0 1; }
+    TextArea:focus { border: tall $accent; }
+    TextArea > .text-area--cursor-line { background: $surface; }
+    #answer { height: 7; }
+    #answer-actions { height: 1; margin: 1 0 1 0; }
+    #answer-state { width: 1fr; color: $muted; }
+    #answer-state.-confirmed { color: $ok; }
+
+    #discussion-head { height: 1; }
+    #discussion-head .caption { width: 1fr; }
+    #chat-scroll { height: 1fr; margin-top: 1; scrollbar-size-vertical: 1; }
+    .msg { height: auto; padding: 0 1; margin-bottom: 1; }
+    .msg-user { background: $surface; border-left: outer $accent; }
+    .msg-agent { border-left: outer $line-strong; }
+    #chat-empty { color: $faint; padding: 0 1; }
+    #chat-status { height: auto; max-height: 5; color: $warn; }
+    #chat-status.-error { color: $err; }
+    #message { height: 5; }
+    #chat-buttons, #draft-buttons { height: 1; margin: 1 0 0 0; }
+    #chat-buttons Button, #draft-buttons Button { margin-right: 1; }
+    #draft { height: auto; max-height: 8; margin-top: 1; padding: 0 1;
+             background: $surface; border-left: outer $ok; }
+    #draft-buttons { margin-bottom: 1; }
+
+    #status { height: 1; padding: 0 1; background: $panel; color: $muted; }
+    #status.-error { color: $err; }
+    Footer { background: $panel; }
+    Footer > FooterKey { background: $panel; color: $muted; }
+    Footer > FooterKey .footer-key--key { background: $panel; color: $accent; }
+    Toast { background: $raised; }
+    .narrow #progress { display: none; }
     .narrow #questions { width: 100%; }
-    .narrow #center, .narrow #discussion { width: 100%; border: none; }
+    .narrow #center, .narrow #discussion { width: 100%; }
+    .narrow #center { padding: 1 1 0 1; }
     '''
+
+    def get_css_variables(self):
+        return {**super().get_css_variables(), **PALETTE}
 
     def __init__(self, session, client=None):
         super().__init__(driver_class=CellMouseDriver)
@@ -223,39 +379,49 @@ class GrillApp(App):
         self.submit_notice = SUBMITTED
 
     def compose(self) -> ComposeResult:
-        yield Static('Grill · загрузка…', id='heading', markup=False)
-        with Horizontal(id='toolbar'):
-            yield Button('Вопросы', id='toggle-questions')
-            yield Button('Вопрос / чат', id='toggle-chat')
-            yield Button('К агенту', id='return')
-            yield Button('Отправить все ответы', id='submit', variant='success')
+        with Horizontal(id='header'):
+            yield Static('Grill', id='heading')
+            yield Static('', id='progress')
+            yield Button('Вопросы', id='toggle-questions', compact=True)
+            yield Button('Вопрос / чат', id='toggle-chat', compact=True)
+            yield Button('К агенту', id='return', compact=True)
+            yield Button('Отправить все ответы', id='submit', variant='success', compact=True)
         with Horizontal(id='body'):
             with Vertical(id='questions'):
-                yield Label('ВОПРОСЫ', classes='caption')
+                yield Label('Вопросы', classes='caption')
                 yield OptionList(id='question-list')
             with Vertical(id='center'):
                 with VerticalScroll(id='question-scroll'):
-                    yield Static('', id='question-text', markup=False)
-                    yield Static('', id='recommendation', markup=False)
-                    yield SelectionList(id='choices')
-                    yield Static('', id='option-details', markup=False)
-                yield Label('ВАШ ОТВЕТ / КОММЕНТАРИЙ', classes='caption')
-                yield TextArea(id='answer', soft_wrap=True, tab_behavior='focus')
-                yield Button('Подтвердить ответ', id='confirm', variant='primary')
+                    yield Static('', id='question-meta')
+                    yield Static('', id='question-title', markup=False)
+                    yield Static('', id='question-body', markup=False)
+                    yield Static('', id='recommendation')
+                    yield ChoiceList(id='choices')
+                with Horizontal(classes='field-head'):
+                    yield Label('Ваш ответ', classes='caption')
+                    yield Static('Enter сохранить · Shift+Enter перенос', classes='hint')
+                yield Composer(id='answer', soft_wrap=True, tab_behavior='focus')
+                with Horizontal(id='answer-actions'):
+                    yield Static('', id='answer-state')
+                    yield Button('Подтвердить ответ', id='confirm', variant='primary', compact=True)
             with Vertical(id='discussion'):
-                yield Label('ОТДЕЛЬНОЕ ОБСУЖДЕНИЕ', classes='caption')
-                yield Button('Агент', id='agent')
+                with Horizontal(id='discussion-head'):
+                    yield Label('Обсуждение', classes='caption')
+                    yield Button('Агент', id='agent', compact=True)
                 with VerticalScroll(id='chat-scroll'):
-                    yield Static('', id='chat-log', markup=False)
+                    yield Static('', id='chat-empty')
                 yield Static('', id='chat-status', markup=False)
-                yield TextArea(id='message', soft_wrap=True, tab_behavior='focus')
+                with Horizontal(classes='field-head'):
+                    yield Label('Сообщение', classes='caption')
+                    yield Static('Enter отправить · Shift+Enter перенос', classes='hint')
+                yield Composer(id='message', soft_wrap=True, tab_behavior='focus')
                 with Horizontal(id='chat-buttons'):
-                    yield Button('Отправить', id='send', variant='primary')
-                    yield Button('Остановить', id='stop')
+                    yield Button('Отправить', id='send', variant='primary', compact=True)
+                    yield Button('Остановить', id='stop', compact=True)
+                    yield Button('Черновик', id='summarize', compact=True)
                 yield Static('', id='draft', markup=False)
                 with Horizontal(id='draft-buttons'):
-                    yield Button('Черновик', id='summarize')
-                    yield Button('В ответ', id='insert')
+                    yield Button('Вставить в мой ответ', id='insert', compact=True)
         yield Static('Подключение…', id='status', markup=False)
         yield Footer()
 
@@ -263,8 +429,10 @@ class GrillApp(App):
         async with self.api_lock:
             return await asyncio.to_thread(self.client.request, path, data)
 
-    def status(self, message):
-        self.query_one('#status', Static).update(message)
+    def status(self, message, error=False):
+        line = self.query_one('#status', Static)
+        line.set_class(error, '-error')
+        line.update(message)
 
     @property
     def q(self):
@@ -284,14 +452,16 @@ class GrillApp(App):
                         if qid in self.state['branches']:
                             self.state['branches'][qid]['input_draft'] = draft
                             self.draft_dirty.add(qid)
-            self.query_one('#heading', Static).update('Grill · ' + self.state['round']['title'])
+            self.query_one('#heading', Static).update(Text.assemble(
+                ('Grill', f"bold {PALETTE['accent']}"), ('  ·  ', PALETTE['faint']),
+                (self.state['round']['title'], f"bold {PALETTE['strong']}")))
             self.refresh_list()
             self.load_question()
             self.apply_layout()
             self.set_interval(.6, self.tick)
             await self.tick()
         except (OSError, ValueError) as exc:
-            self.status(f'Не удалось открыть раунд: {exc}. Закройте и повторите open.')
+            self.status(f'Не удалось открыть раунд: {exc}. Закройте и повторите open.', error=True)
 
     async def notify_agent(self):
         """Wake the agent in its own pane; without Herdr the owner does it by hand."""
@@ -314,26 +484,41 @@ class GrillApp(App):
         listing = self.query_one('#question-list', OptionList)
         with self.prevent(OptionList.OptionSelected):
             listing.clear_options()
-            for q in self.state['round']['questions']:
-                mark = '✓' if self.state['answers'][q['id']]['confirmed'] else '○'
-                listing.add_option(Text(f'{mark} {q["title"]}'))
+            for q in self.state["round"]["questions"]:
+                answer = self.state['answers'][q['id']]
+                if answer['confirmed']:
+                    mark = ('✓', PALETTE['ok'])
+                elif answer['selected'] or answer['text'].strip():
+                    mark = ('◐', PALETTE['warn'])
+                else:
+                    mark = ('○', PALETTE['faint'])
+                # A grid keeps wrapped titles aligned under the first line.
+                row = Table.grid(padding=(0, 1))
+                row.add_column(width=1)
+                row.add_column(ratio=1)
+                row.add_row(Text(mark[0], style=mark[1]), Text(q['title']))
+                listing.add_option(row)
             listing.highlighted = self.index
+        total = len(self.state['answers'])
+        count = sum(a['confirmed'] for a in self.state['answers'].values())
+        self.query_one('#progress', Static).update(f'подтверждено {count} из {total}')
 
     def load_question(self):
         q = self.q
         answer = self.state['answers'][q['id']]
-        self.query_one('#question-text', Static).update(q['title'] + '\n\n' + q['body'])
-        self.query_one('#recommendation', Static).update('Рекомендация\n' + q['recommendation'])
-        choices = self.query_one('#choices', SelectionList)
-        with self.prevent(SelectionList.SelectedChanged, SelectionList.SelectionToggled, TextArea.Changed):
-            choices.clear_options()
-            choices.add_options([(Text(o['label']), o['id'], o['id'] in answer['selected'])
-                                 for o in q.get('options', [])])
+        questions = self.state['round']['questions']
+        self.query_one('#question-meta', Static).update(
+            f'Вопрос {self.index + 1} из {len(questions)}  ·  {MODES.get(q.get("mode", "single"), "")}')
+        self.query_one('#question-title', Static).update(q['title'])
+        self.query_one('#question-body', Static).update(q['body'])
+        self.query_one('#recommendation', Static).update(Text.assemble(
+            ('Рекомендация', f"bold {PALETTE['accent']}"), '\n', q['recommendation']))
+        choices = self.query_one('#choices', ChoiceList)
+        with self.prevent(TextArea.Changed):
+            choices.load(q.get('options', []), answer['selected'], q.get('mode', 'single'))
             choices.display = q.get('mode') != 'text' and bool(q.get('options'))
             self.query_one('#answer', TextArea).load_text(answer['text'])
             self.query_one('#message', TextArea).load_text(self.state['branches'][q['id']].get('input_draft', ''))
-        self.query_one('#option-details', Static).update('\n\n'.join(
-            o['label'] + ': ' + o['description'] for o in q.get('options', []) if o.get('description')))
         self.query_one('#question-scroll').scroll_home(animate=False)
         self.chat_fingerprint = None
         self.refresh_chat()
@@ -349,10 +534,15 @@ class GrillApp(App):
         self.query_one('#stop').disabled = submitted or not running
         self.query_one('#return', Button).variant = 'success' if submitted else 'default'
         agent = self.query_one('#agent', Button)
-        agent.label = label(self.chat_runtime())
+        agent.label = label(self.chat_runtime()) + '  ▾'
         agent.disabled = submitted or running
-        confirmed = self.state['answers'][self.q['id']]['confirmed']
-        self.query_one('#confirm', Button).label = 'Ответ подтверждён ✓' if confirmed else 'Подтвердить ответ'
+        answer = self.state['answers'][self.q['id']]
+        confirmed = answer['confirmed']
+        self.query_one('#confirm', Button).label = 'Подтверждено ✓' if confirmed else 'Подтвердить ответ'
+        state = self.query_one('#answer-state', Static)
+        state.set_class(confirmed, '-confirmed')
+        state.update('Ответ подтверждён' if confirmed else
+                     'Черновик, не подтверждён' if answer['selected'] or answer['text'].strip() else 'Ответа пока нет')
 
     def chat_runtime(self):
         branch = self.state['branches'][self.q['id']]
@@ -363,14 +553,25 @@ class GrillApp(App):
         fingerprint = json.dumps(branch.get('messages', []), ensure_ascii=False)
         if fingerprint != self.chat_fingerprint:
             self.chat_fingerprint = fingerprint
-            text = '\n\n'.join(('Вы' if m['role'] == 'user' else 'Агент') + '\n' + m['text']
-                               for m in branch['messages'])
-            self.query_one('#chat-log', Static).update(text or 'Обсудите этот вопрос. Переписка не попадёт основному агенту.')
-            self.query_one('#chat-scroll').scroll_end(animate=False)
-        self.query_one('#chat-status', Static).update(branch.get('error') or (
+            scroll = self.query_one('#chat-scroll', VerticalScroll)
+            scroll.query('.msg').remove()
+            runtime = self.chat_runtime()
+            agent = HARNESSES[runtime['harness']].label if runtime.get('harness') in HARNESSES else 'Агент'
+            scroll.mount_all([chat_message(m['role'], m['text'], 'Вы' if m['role'] == 'user' else agent)
+                              for m in branch['messages']])
+            empty = self.query_one('#chat-empty', Static)
+            empty.display = not branch['messages']
+            empty.update('Спросите агента об этом вопросе. Он видит только его контекст, '
+                         'а переписка не попадёт основному агенту.')
+            scroll.call_after_refresh(scroll.scroll_end, animate=False)
+        status = self.query_one('#chat-status', Static)
+        status.set_class(bool(branch.get('error')), '-error')
+        status.update(branch.get('error') or (
             'Агент отвечает… Можно перейти к другому вопросу.' if branch['status'] == 'running' else ''))
-        self.query_one('#draft', Static).update(branch.get('summary', ''))
-        self.query_one('#draft').display = bool(branch.get('summary'))
+        summary = branch.get('summary', '')
+        self.query_one('#draft', Static).update(summary)
+        self.query_one('#draft').display = bool(summary)
+        self.query_one('#draft-buttons').display = bool(summary)
 
     async def flush(self):
         for qid in list(self.dirty):
@@ -403,11 +604,10 @@ class GrillApp(App):
             if self.state['submitted']:
                 self.status(self.submit_notice)
             elif not self.dirty and not self.draft_dirty:
-                total = len(self.state['answers'])
-                count = sum(a['confirmed'] for a in self.state['answers'].values())
-                self.status(f'Сохранено · подтверждено {count}/{total} · отправка только кнопкой «Отправить все ответы»')
+                self.status('Сохранено. Когда ответите на все вопросы, нажмите «Отправить все ответы».')
         except (OSError, ValueError) as exc:
-            self.status(f'Нет сохранения на сервере: {exc}. Черновики сохранены локально; сообщения повторно не отправляются.')
+            self.status(f'Нет сохранения на сервере: {exc}. Черновики сохранены локально; сообщения повторно не отправляются.',
+                        error=True)
         except NoMatches:
             pass  # The interval can fire while the app tears down its widgets.
 
@@ -433,16 +633,18 @@ class GrillApp(App):
         self.checkpoint()
         self.status('Сохраняю…')
 
-    @on(SelectionList.SelectionToggled, '#choices')
+    @on(Composer.Submitted)
+    async def composer_submitted(self, event):
+        if event.composer.id == 'answer':
+            await self.action_confirm()
+        else:
+            self.query_one('#send', Button).press()
+
+    @on(ChoiceList.Toggled)
     def selected(self, event):
         if not self.state or self.state['submitted']:
             return
-        choices = event.selection_list
-        if self.q.get('mode', 'single') == 'single' and event.selection.value in choices.selected:
-            with self.prevent(SelectionList.SelectedChanged, SelectionList.SelectionToggled):
-                for value in list(choices.selected):
-                    if value != event.selection.value:
-                        choices.deselect(value)
+        choices = event.choices
         self.state['answers'][self.q['id']].update(selected=list(choices.selected), confirmed=False)
         self.dirty.add(self.q['id'])
         self.checkpoint()
@@ -456,7 +658,7 @@ class GrillApp(App):
         try:
             await self.flush()
         except (OSError, ValueError) as exc:
-            self.status(f'Черновик сохранён локально: {exc}')
+            self.status(f'Черновик сохранён локально: {exc}', error=True)
         self.index = event.option_index
         self.load_question()
         self.compact_view = 'center'
@@ -478,7 +680,7 @@ class GrillApp(App):
             self.refresh_controls()
             self.status('Ответ подтверждён. Перейдите к следующему вопросу.')
         except (OSError, ValueError) as exc:
-            self.status(f'Подтверждение пока не сохранено на сервере: {exc}')
+            self.status(f'Подтверждение пока не сохранено на сервере: {exc}', error=True)
 
     @on(Button.Pressed)
     async def pressed(self, event):
@@ -536,7 +738,7 @@ class GrillApp(App):
                     self.apply_layout()
                     editor.focus()
         except (OSError, ValueError) as exc:
-            self.status(f'Действие не подтверждено: {exc}. Проверьте состояние перед повторной отправкой.')
+            self.status(f'Действие не подтверждено: {exc}. Проверьте состояние перед повторной отправкой.', error=True)
 
     async def action_agent(self):
         if not self.state or self.state['submitted']:
@@ -549,7 +751,7 @@ class GrillApp(App):
         try:
             catalog = await self.api('/api/catalog')
         except (OSError, ValueError) as exc:
-            self.status(f'Список моделей недоступен: {exc}')
+            self.status(f'Список моделей недоступен: {exc}', error=True)
             catalog = {'ready': False, 'harnesses': {}}
         chat = branch['runtime'] if branch.get('thread_id') else None
         parent = self.state.get('parent_runtime', self.state['runtime'])
@@ -563,14 +765,17 @@ class GrillApp(App):
                 self.load_question()
                 self.status('Агент для новых чатов: ' + label(self.state['runtime']))
             except (OSError, ValueError) as exc:
-                self.status(f'Настройки не применены: {exc}')
+                self.status(f'Настройки не применены: {exc}', error=True)
         self.push_screen(AgentScreen(catalog, self.state['runtime'], parent, chat), chosen)
 
     def action_answer_field(self):
         self.compact_view = 'center'
         self.expanded_chat = False
         self.apply_layout()
-        self.query_one('#answer').focus()
+        editor = self.query_one('#answer', TextArea)
+        # Continue the answer instead of typing in front of it after a reload.
+        editor.move_cursor(editor.document.end)
+        editor.focus()
 
     def action_message_field(self):
         self.compact_view = 'discussion'
@@ -597,6 +802,9 @@ class GrillApp(App):
     def apply_layout(self):
         narrow = self.size.width < 110
         self.set_class(narrow, 'narrow')
+        # Wide screens show every column; the view toggles only matter when narrow.
+        for ident in ('toggle-questions', 'toggle-chat'):
+            self.query_one('#' + ident).display = narrow
         for name in ('questions', 'center', 'discussion'):
             self.query_one('#' + name).display = name == self.compact_view if narrow else (
                 name == 'discussion' if self.expanded_chat else True)

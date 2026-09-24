@@ -282,8 +282,8 @@ def main():
                     except OSError:pass
                 threading.Thread(target=drain,daemon=True).start()
             attach()
-            until(lambda: 'ВАШ ОТВЕТ' in re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', transcript.decode('utf-8',errors='ignore')), 'client displays selected machine')
-            screen=until(lambda: (s if 'ВАШ ОТВЕТ' in str(s:=ctl('screen')) else None),'TUI screen')
+            until(lambda: 'Ваш ответ' in re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', transcript.decode('utf-8',errors='ignore')), 'client displays selected machine')
+            screen=until(lambda: (s if 'Ваш ответ' in str(s:=ctl('screen')) else None),'TUI screen')
             # F4 focuses the answer field; actual terminal bracketed paste crosses Herdr.
             os.write(master,b'\x1bOS')
             time.sleep(.2)
@@ -307,8 +307,8 @@ def main():
             # Detach/reconnect the client while the server and tab survive.
             stop_process(client);os.close(master);master=None
             attach()
-            until(lambda: any('ВАШ ОТВЕТ' in line for line in screen_buffer.display), 'client after reconnect')
-            until(lambda:'ВАШ ОТВЕТ' in str(ctl('screen')),'screen after reconnect')
+            until(lambda: any('Ваш ответ' in line for line in screen_buffer.display), 'client after reconnect')
+            until(lambda:'Ваш ответ' in str(ctl('screen')),'screen after reconnect')
             os.write(master,b'\x11')
             until(lambda:not ctl('tui-running'),'TUI exit leaves server running')
             ctl('reopen')

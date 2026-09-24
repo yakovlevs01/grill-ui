@@ -5,9 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from textual.widgets import Button, Checkbox, Input, Select, TextArea, SelectionList
+from textual.widgets import Button, Checkbox, Input, Select, TextArea
 import grill_ui as g
-from grill_tui import AgentScreen, GrillApp, CUSTOM
+from grill_tui import AgentScreen, ChoiceList, GrillApp, CUSTOM
 import test_grill_ui
 
 CATALOG = {'ready': True, 'harnesses': {
@@ -118,11 +118,12 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(150, 45)) as pilot:
             await pilot.pause()
             # Mouse selects an option, keyboard edits multiline Russian text.
-            await pilot.click('#choices', offset=(3, 1))
+            await pilot.click('#choices', offset=(3, 0))
             await pilot.click('#answer')
-            await pilot.press('П','р','и','в','е','т','enter','М','и','р')
+            await pilot.press('П','р','и','в','е','т','shift+enter','М','и','р','ctrl+j','!')
             await pilot.pause()
-            self.assertIn('\n', app.query_one('#answer', TextArea).text)
+            self.assertEqual(app.query_one('#answer', TextArea).text, 'Привет\nМир\n!')
+            self.assertFalse(self.store.state['answers']['Q1']['confirmed'])
             await pilot.click('#confirm')
             await pilot.pause()
             self.assertTrue(self.store.state['answers']['Q1']['confirmed'])
@@ -159,6 +160,39 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(app.focused, back)
             self.assertEqual(back.variant, 'success')
             self.assertTrue(any('Готово' in str(n.message) for n in app._notifications))
+
+    async def test_f4_appends_and_f6_moves_to_chat_without_touching_answer(self):
+        app = GrillApp(self.fixture.root, self.api)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause()
+            app.query_one('#answer', TextArea).load_text('Мой ')
+            await pilot.press('f4', 'О', 'т', 'в', 'е', 'т')
+            await pilot.press('f6', 'Ч', 'а', 'т')
+            await pilot.pause()
+            self.assertEqual(app.query_one('#answer', TextArea).text, 'Мой Ответ')
+            self.assertEqual(app.query_one('#message', TextArea).text, 'Чат')
+            await pilot.press('f5')
+            await pilot.pause()
+            self.assertIsInstance(app.screen, AgentScreen)
+            await pilot.press('f2', 'f3', 'f4', 'f5', 'f6')
+            await pilot.pause()
+            self.assertIsInstance(app.screen, AgentScreen)
+
+    async def test_enter_confirms_answer_and_sends_message(self):
+        app = GrillApp(self.fixture.root, self.api)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause()
+            await pilot.press('f4', 'Д', 'а', 'enter')
+            await pilot.pause()
+            self.assertEqual(self.store.state['answers']['Q1'], {'selected': [], 'text': 'Да', 'confirmed': True})
+            self.assertIs(app.focused, app.query_one('#answer'))
+            await pilot.press('f6', 'В', 'о', 'п', 'р', 'о', 'с', 'enter')
+            await pilot.pause()
+            messages = self.store.state['branches']['Q1']['messages']
+            self.assertEqual(messages[0], {'role': 'user', 'text': 'Вопрос'})
+            self.assertEqual(app.query_one('#message', TextArea).text, '')
+            self.assertEqual(len(app.query('.msg')), 2)
+            self.assertEqual(len(app.query('.msg-user')), 1)
 
     async def test_submit_types_notice_into_agent_pane(self):
         import grill_herdr
@@ -207,8 +241,8 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         app = GrillApp(self.fixture.root, self.api)
         async with app.run_test(size=(150,45)) as pilot:
             await pilot.pause()
-            choices = app.query_one('#choices', SelectionList)
-            await pilot.click('#choices', offset=(3, 1))
+            choices = app.query_one('#choices', ChoiceList)
+            await pilot.click('#choices', offset=(3, 0))
             await pilot.press('down','space')
             await pilot.pause()
             self.assertEqual(choices.selected, ['sync'])
