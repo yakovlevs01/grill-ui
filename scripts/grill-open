@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+grill_data="${XDG_DATA_HOME:-$HOME/.local/share}/grill-ui"
+grill_root="${HERDR_PLUGIN_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}"
+exec "$grill_data/venv/bin/python" "$grill_root/scripts/grill_herdr.py" reopen
