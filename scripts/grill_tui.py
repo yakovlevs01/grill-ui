@@ -80,20 +80,18 @@ class Composer(TextArea):
 class ChoiceRow:
     """An option row; a recommended one gets an amber stripe along its right edge.
 
-    Only the owner's chosen option is filled; the fill and the stripe span
-    exactly the option's lines, from the left gutter to the right edge.
+    The stripe spans exactly the option's lines; the gap below is a separator.
     """
     def __init__(self, body, recommended, chosen):
         self.body, self.recommended, self.chosen = body, recommended, chosen
 
     def __rich_console__(self, console, options):
-        fill = Style(bgcolor=PALETTE['surface']) if self.chosen else Style()
         width = options.max_width - 1 - (2 if self.recommended else 0)
-        for line in console.render_lines(self.body, options.update_width(width), style=fill, pad=True):
-            yield Segment(' ', fill)  # Left gutter; the cursor bar replaces it.
+        for line in console.render_lines(self.body, options.update_width(width), pad=True):
+            yield Segment(' ')  # Left gutter; the cursor bar replaces it.
             yield from line
             if self.recommended:
-                yield Segment(' ▐', fill + Style(color=PALETTE['warn']))
+                yield Segment(' ▐', Style(color=PALETTE['warn']))
             yield Segment.line()
 
 
@@ -152,7 +150,7 @@ class ChoiceList(OptionList):
             row.add_row(Text(mark, style=PALETTE['accent' if chosen else 'faint']), body)
             self.add_option(ChoiceRow(row, recommended, chosen))
             if index < len(self.choices) - 1:
-                self.add_option(None)  # The gap below belongs to no option, so no fill or stripe reaches it.
+                self.add_option(None)  # The gap below belongs to no option, so the stripe stops at the option.
         if self.choices:
             self.highlighted = min(highlighted or 0, len(self.choices) - 1)
 
@@ -165,7 +163,7 @@ class ChoiceList(OptionList):
         return strips
 
     def render_line(self, y):
-        """Mark the cursor with an accent bar in the left gutter instead of a fill."""
+        """Mark the cursor with an accent bar in the left gutter; nothing is filled."""
         strip = super().render_line(y)
         try:
             index, offset = self._lines[self.scroll_offset.y + y]
@@ -347,13 +345,14 @@ class GrillApp(App):
     CSS = '''
     Screen { background: ansi_default; color: $text; }
     Button { border: none; height: 1; min-width: 0; padding: 0 2;
-             background: $raised; color: $text; text-style: none; }
-    Button:hover { background: $line-strong; color: $strong; }
-    Button:focus { background: $accent-dim; color: $strong; text-style: bold; }
-    Button.-primary, Button.-success { background: $accent; color: $bg; text-style: bold; }
-    Button.-primary:hover, Button.-success:hover { background: $strong; color: $bg; }
-    Button.-primary:focus, Button.-success:focus { background: $strong; color: $bg; }
-    Button:disabled { background: $surface; color: $faint; text-style: none; }
+             background: ansi_default; color: $muted; text-style: none; }
+    /* Nothing is filled: state is color and style on the terminal's own background. */
+    Button:hover { background: ansi_default; color: $strong; }
+    Button:focus { background: ansi_default; color: $strong; text-style: bold underline; }
+    Button.-primary, Button.-success { background: ansi_default; color: $accent; text-style: bold; }
+    Button.-primary:hover, Button.-success:hover { background: ansi_default; color: $strong; }
+    Button.-primary:focus, Button.-success:focus { background: ansi_default; color: $strong; text-style: bold underline; }
+    Button:disabled { background: ansi_default; color: $faint; text-style: none; }
 
     #header { height: 1; padding: 0 1; }
     #heading { width: 1fr; }
@@ -365,26 +364,26 @@ class GrillApp(App):
     #questions .caption { padding: 0 2; }
     #question-list { height: 1fr; background: ansi_default; border: none; padding: 0 1; }
     #question-list > .option-list--option { padding: 0 1; }
-    #question-list > .option-list--option-highlighted { background: $selection; color: $strong; text-style: none; }
-    #question-list:focus > .option-list--option-highlighted { background: $accent-dim; }
-    #question-list > .option-list--option-hover { background: $surface; }
+    #question-list > .option-list--option-highlighted { background: ansi_default; color: $strong; text-style: bold; }
+    #question-list:focus > .option-list--option-highlighted { background: ansi_default; color: $accent; }
+    #question-list > .option-list--option-hover { background: ansi_default; color: $strong; }
 
     #question-list > .option-list--option-disabled { color: $muted; }
     #center { width: 1fr; padding: 1 3 0 3; }
     #question-view { height: 1fr; }
-    #waiting { height: auto; max-width: 96; padding: 1 2; background: $surface; border-left: outer $accent; }
+    #waiting { height: auto; max-width: 96; padding: 0 2; border-left: outer $accent; }
     #discussion { width: 38%; padding: 1 2 0 2; border-left: solid $divider; }
     .caption { height: 1; color: $muted; text-style: bold; }
     #question-scroll { height: 1fr; scrollbar-size-vertical: 1; }
     #question-meta { height: 1; color: $muted; }
     #question-title { height: auto; color: $strong; text-style: bold; margin: 1 0 1 0; }
-    #question-body { height: auto; max-width: 96; padding: 0 1; background: $surface; }
+    #question-body { height: auto; max-width: 96; }
     #recommendation { height: auto; max-width: 96; margin-top: 1; padding: 0 1;
                       border-left: outer $accent; }
     #choices { height: auto; max-height: 20; margin-top: 1; max-width: 96;
-               background: $bg; border: none; padding: 0; }
+               background: ansi_default; border: none; padding: 0; }
     #choices, #choices:focus { background: ansi_default; }
-    /* Only the owner's chosen option is filled (ChoiceRow); the cursor is a bar in the gutter. */
+    /* The chosen option shows by its mark and color; the cursor is a bar in the gutter. */
     #choices > .option-list--option { padding: 0; }
     #choices > .option-list--option-highlighted,
     #choices:focus > .option-list--option-highlighted,
@@ -394,13 +393,9 @@ class GrillApp(App):
     .field-head { height: 1; margin-top: 1; }
     .field-head .caption { width: 1fr; }
     .hint { width: auto; color: $faint; }
-    /* Fields stay transparent; the answer is filled once it holds text, like a chosen option. */
     TextArea { height: 6; background: ansi_default; border: round $line-strong; padding: 0 1; }
     TextArea:focus { border: round $accent; }
     TextArea > .text-area--cursor-line { background: ansi_default; }
-    #answer.-filled, #answer.-filled > .text-area--cursor-line { background: $surface; }
-    #answer.-filled { border: tall $surface; }
-    #answer.-filled:focus { border: tall $accent; }
     #answer { height: 7; }
     #answer-actions { height: 1; margin: 1 0 1 0; }
     #answer-state { width: 1fr; color: $muted; }
@@ -420,15 +415,15 @@ class GrillApp(App):
     #agent-harness { max-width: 16; }
     #agent-effort { max-width: 12; margin-right: 0; }
     #agent-row SelectCurrent { background: ansi_default; color: $text; border: none; padding: 0 1; }
-    #agent-row Select:focus > SelectCurrent { background: $accent-dim; color: $strong; }
+    #agent-row Select:focus > SelectCurrent { background: ansi_default; color: $accent; text-style: bold; }
     #agent-row SelectOverlay { background: $raised; border: tall $line-strong; }
     #agent-custom { margin-top: 1; background: ansi_default; border: none; }
-    #agent-custom:focus { background: $accent-dim; }
+    #agent-custom:focus { background: ansi_default; color: $accent; }
     #agent-chat { height: auto; margin-top: 1; }
     #agent-note { width: 1fr; height: auto; color: $muted; }
     #chat-scroll { height: 1fr; margin-top: 1; scrollbar-size-vertical: 1; }
     .msg { height: auto; padding: 0 1; margin-bottom: 1; }
-    .msg-user { background: $surface; border-left: outer $accent; }
+    .msg-user { border-left: outer $accent; }
     .msg-agent { border-left: outer $line-strong; }
     #chat-empty { color: $faint; padding: 0 1; }
     #chat-status { height: auto; max-height: 5; color: $warn; }
@@ -437,7 +432,7 @@ class GrillApp(App):
     #chat-buttons, #draft-buttons { height: 1; margin: 1 0 0 0; }
     #chat-buttons Button, #draft-buttons Button { margin-right: 1; }
     #draft { height: auto; max-height: 8; margin-top: 1; padding: 0 1;
-             background: $surface; border-left: outer $ok; }
+             border-left: outer $ok; }
     #draft-buttons { margin-bottom: 1; }
 
     #status { height: 1; padding: 0 1; color: $muted; }
@@ -758,7 +753,6 @@ class GrillApp(App):
         self.query_one('#stop').disabled = finished or not running
         self.query_one('#agent-picker').disabled = finished
         answer = self.state['answers'][qid]
-        self.query_one('#answer').set_class(bool(answer['text'].strip()), '-filled')
         confirmed = answer['confirmed']
         confirm = self.query_one('#confirm', Button)
         confirm.display = live
