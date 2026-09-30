@@ -1,11 +1,11 @@
 id = "local.grill-ui"
 name = "Grill"
-description = "Reopen the current question round in a tab on its owning Herdr server."
+description = "Reopen the current grill in its tab on the owning Herdr server."
 version = "0.2.0"
 min_herdr_version = "0.9.0"
 platforms = ["linux", "macos"]
 
 [[actions]]
 id = "reopen"
-title = "Open current Grill round"
+title = "Open current Grill"
 command = ["sh", "scripts/grill-open"]
