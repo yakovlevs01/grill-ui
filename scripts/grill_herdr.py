@@ -156,6 +156,26 @@ def owned_pane(owner, env):
     return panes[0]
 
 
+def run_tui(owner, env, session):
+    """Type the TUI command into the Grill pane and wait until the TUI holds its lock."""
+    command = shlex.join([str(PYTHON), str(ROOT / 'scripts/grill_tui.py'), '--session', str(session)])
+    herdr(['pane', 'run', owner['pane'], command], env)
+    retried = False
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        time.sleep(.25)
+        if tui_alive(session):
+            return
+        info = herdr(['pane', 'process-info', '--pane', owner['pane']], env)['process_info']
+        idle = info['foreground_process_group_id'] == info['shell_pid']
+        # A new pane's shell may drop an Enter typed before its first prompt; the
+        # command then sits unexecuted. Enter again only while nothing runs there.
+        if idle and not retried and time.monotonic() > deadline - 17:
+            herdr(['pane', 'send-keys', owner['pane'], 'enter'], env)
+            retried = True
+    raise ValueError('Grill TUI did not start; look at the Grill tab')
+
+
 def open_tab(args):
     session = Path(args.session).resolve()
     require((session / 'state.json').is_file(), 'Initialize the grill first')
@@ -184,8 +204,7 @@ def open_tab(args):
                     require(info['foreground_process_group_id'] == info['shell_pid'],
                             'Grill tab contains another foreground process; refusing to type into it')
                     fcntl.flock(tui_lock, fcntl.LOCK_UN)
-                    command = shlex.join([str(PYTHON), str(ROOT / 'scripts/grill_tui.py'), '--session', str(session)])
-                    herdr(['pane', 'run', owner['pane'], command], env)
+                    run_tui(owner, env, session)
             if args.focus:
                 herdr(['tab', 'focus', owner['tab']], env)
             print(json.dumps({'tab': owner['tab'], 'reused': True}))
@@ -196,9 +215,8 @@ def open_tab(args):
         owner.update(tab=created['tab']['tab_id'], pane=created['root_pane']['pane_id'],
                      terminal=created['root_pane']['terminal_id'])
         write(path, owner)
-        command = shlex.join([str(PYTHON), str(ROOT / 'scripts/grill_tui.py'), '--session', str(session)])
         try:
-            herdr(['pane', 'run', owner['pane'], command], env)
+            run_tui(owner, env, session)
             if args.focus:
                 herdr(['tab', 'focus', owner['tab']], env)
         except Exception:

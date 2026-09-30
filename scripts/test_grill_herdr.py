@@ -91,6 +91,32 @@ class OwnershipTests(unittest.TestCase):
         finally:
             f.tearDown()
 
+    def test_run_tui_repeats_an_enter_the_new_shell_dropped(self):
+        owner = {'pane': 'w1:p2'}
+        calls, entered = [], []
+        def fake(args, env=None):
+            calls.append(args)
+            if args[:2] == ['pane', 'send-keys']:
+                entered.append(True)
+            # The shell sits at its prompt: nothing runs in the foreground.
+            return {'process_info': {'foreground_process_group_id': 7, 'shell_pid': 7}}
+        clock = iter(range(0, 1000))
+        with patch.object(h, 'herdr', fake), patch.object(h.time, 'sleep'), \
+             patch.object(h.time, 'monotonic', lambda: next(clock)), \
+             patch.object(h, 'tui_alive', lambda session: bool(entered)):
+            h.run_tui(owner, {}, '/tmp/s')
+        self.assertEqual(calls[0][:3], ['pane', 'run', 'w1:p2'])
+        self.assertEqual([c for c in calls if c[1] == 'send-keys'], [['pane', 'send-keys', 'w1:p2', 'enter']])
+        # A TUI that never starts is reported, and Enter is pressed only once.
+        calls.clear(); entered.clear()
+        clock = iter(range(0, 1000))
+        with patch.object(h, 'herdr', fake), patch.object(h.time, 'sleep'), \
+             patch.object(h.time, 'monotonic', lambda: next(clock)), \
+             patch.object(h, 'tui_alive', lambda session: False):
+            with self.assertRaisesRegex(ValueError, 'did not start'):
+                h.run_tui(owner, {}, '/tmp/s')
+        self.assertEqual(sum(c[1] == 'send-keys' for c in calls), 1)
+
     def test_finish_waits_for_the_latest_round(self):
         import test_grill_ui
         f = test_grill_ui.RoundTests()
