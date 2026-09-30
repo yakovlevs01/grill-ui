@@ -54,6 +54,7 @@ class OwnershipTests(unittest.TestCase):
             # The notice names only the newest result file, never an earlier round's.
             newest = str(Path(tmp).resolve() / 'submissions/0002.json')
             h.write(Path(tmp)/'status.json', {'submitted': True, 'result_file': newest})
+            h.write(Path(newest), {'round_id': 'r2', 'answers': [], 'reopen': []})
             pane = {'pane_id': 'w1:p1', 'tab_id': 'w1:t1', 'terminal_id': 'term-a'}
             calls = []
             def fake(args, env=None):
@@ -65,6 +66,11 @@ class OwnershipTests(unittest.TestCase):
                 notice = h.SUBMIT_NOTICE + '. Файл: ' + newest
                 self.assertEqual(calls[1:], [['pane', 'send-text', 'w1:p1', notice],
                                              ['pane', 'send-keys', 'w1:p1', 'enter']])
+                # A reopen-only submit has no round and says so.
+                h.write(Path(newest), {'round_id': None, 'answers': [], 'reopen': [{'question_id': 'Q1'}]})
+                calls.clear()
+                h.notify_agent(tmp)
+                self.assertEqual(calls[1][3], h.REOPEN_NOTICE + '. Файл: ' + newest)
                 pane['terminal_id'] = 'term-b'
                 calls.clear()
                 with self.assertRaisesRegex(ValueError, 'terminal is gone'):
@@ -98,6 +104,16 @@ class OwnershipTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'latest round'):
                     h.finish(h.argparse.Namespace(session=str(f.root)))
             herdr.assert_not_called()
+            # A pending reopen request would be lost; it is sent or cancelled first.
+            test_grill_ui.answer_all(f.store)
+            f.store.submit()
+            f.store.reopen('Q1', 'Новые факты')
+            with patch.object(h, 'herdr') as herdr:
+                with self.assertRaisesRegex(ValueError, 'Reopen requests'):
+                    h.finish(h.argparse.Namespace(session=str(f.root)))
+            herdr.assert_not_called()
+            with self.assertRaisesRegex(ValueError, 'Reopen requests'):
+                f.store.finish()
         finally:
             f.tearDown()
 
@@ -118,6 +134,7 @@ class HandoffTests(unittest.TestCase):
         h.write(self.session/'herdr.json', self.owner)
         # A notice follows a submit, which always leaves the newest result in status.json.
         h.write(self.session/'status.json', {'submitted': True, 'result_file': str(self.session/'submissions/0001.json')})
+        h.write(self.session/'submissions/0001.json', {'round_id': 'r1', 'answers': [], 'reopen': []})
         tui =['python', str(h.ROOT/'scripts/grill_tui.py'), '--session', str(self.session)]
         self.processes = {'w1:p2': {'shell_pid': 50, 'foreground_processes': [{'pid': 51, 'argv': tui}]},
                           'w1:p1': {'shell_pid': 40}}

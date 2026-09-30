@@ -24,6 +24,7 @@ STAMP = DATA / 'venv/grill-requirements.sha256'
 CONTEXT_KEYS = ('HERDR_SOCKET_PATH', 'HERDR_SESSION', 'HERDR_CONFIG_PATH',
                 'HERDR_BIN_PATH', 'HERDR_WORKSPACE_ID', 'HERDR_TAB_ID', 'HERDR_PANE_ID')
 SUBMIT_NOTICE = 'Готово: ответы Grill отправлены'
+REOPEN_NOTICE = 'Готово: запрос на пересмотр Grill отправлен'
 
 
 def herdr_binary(env):
@@ -215,6 +216,7 @@ def finish(args):
     # Called once, after the owner confirmed the final picture; an open round keeps the tab.
     status = summary(load_state(session), session)
     require(status['submitted'], 'The latest round has not been submitted; leave the tab open')
+    require(not status['reopen'], 'Reopen requests are pending; they must be sent or cancelled first')
     with locked(session):
         owner = read(session / 'herdr.json')
         if owner.get('finished'):
@@ -262,7 +264,10 @@ def return_to_agent(session):
 
 def submit_notice(session):
     # Only the newest result file: the agent reads what changed, and the owner can open it too.
-    return f'{SUBMIT_NOTICE}. Файл: {read(Path(session) / "status.json")["result_file"]}'
+    path = read(Path(session) / 'status.json')['result_file']
+    # A reopen-only submit carries no round; say so, or the agent looks for answers.
+    notice = SUBMIT_NOTICE if read(path)['round_id'] else REOPEN_NOTICE
+    return f'{notice}. Файл: {path}'
 
 
 def notify_agent(session):

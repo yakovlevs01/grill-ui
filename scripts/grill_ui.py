@@ -316,6 +316,7 @@ class Store:
     def finish(self):
         with self.lock:
             require(open_round(self.state) is None, 'Submit the round before finishing')
+            require(not self.state['reopen'], 'Reopen requests are pending; they must be sent or cancelled first')
             self.state['finished'] = True
             self.save()
 
