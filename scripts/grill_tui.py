@@ -22,9 +22,10 @@ from textual.css.query import NoMatches
 from textual.message import Message
 from textual.strip import Strip
 from textual.widgets import Button, Footer, Input, Label, OptionList, Select, Static, TextArea
+from textual.widgets.option_list import Option
 from grill_client import Client
 from grill_harness import HARNESSES, label
-from grill_ui import read, write
+from grill_ui import open_round, read, write
 
 CUSTOM = '__custom__'
 # The owner's terminal theme (2026 Dark): one gray family, one accent, status colors only for state.
@@ -37,7 +38,9 @@ PALETTE = {'bg': '#121314', 'panel': '#161718', 'surface': '#1c1d1f', 'raised': 
 MODES = {'single': 'Один вариант', 'multiple': 'Несколько вариантов', 'text': 'Свободный ответ'}
 SUBMITTED = 'Все ответы отправлены. Нажмите «К агенту» и напишите агенту «Готово».'
 ALL_CONFIRMED = 'Все ответы подтверждены. Нажмите «Отправить все ответы» или Enter на этой кнопке.'
-AGENT_NOTIFIED = 'Все ответы отправлены, агент получил «Готово» и путь к файлу: {path}'
+AGENT_NOTIFIED = 'Отправлено, агент получил «Готово» и путь к новому файлу: {path}'
+WAITING = 'Агент готовит следующий раунд. Прошлые вопросы и их чаты доступны в списке.'
+FINISHED = 'Grill завершён. Ответы и чаты только для чтения.'
 
 
 class CellMouseDriver(LinuxDriver):
@@ -363,7 +366,10 @@ class GrillApp(App):
     #question-list:focus > .option-list--option-highlighted { background: $accent-dim; }
     #question-list > .option-list--option-hover { background: $surface; }
 
+    #question-list > .option-list--option-disabled { color: $muted; }
     #center { width: 1fr; padding: 1 3 0 3; }
+    #question-view { height: 1fr; }
+    #waiting { height: auto; max-width: 96; padding: 1 2; background: $surface; border-left: outer $accent; }
     #discussion { width: 38%; padding: 1 2 0 2; border-left: solid $divider; }
     .caption { height: 1; color: $muted; text-style: bold; }
     #question-scroll { height: 1fr; scrollbar-size-vertical: 1; }
@@ -396,6 +402,12 @@ class GrillApp(App):
     #answer-actions { height: 1; margin: 1 0 1 0; }
     #answer-state { width: 1fr; color: $muted; }
     #answer-state.-confirmed { color: $ok; }
+    #answer-actions Button { margin-left: 1; }
+    #reopen-box { height: auto; margin-bottom: 1; padding: 0 1; border-left: outer $warn; }
+    #reopen-note { height: auto; color: $text; }
+    #reopen-reason { height: 4; }
+    #reopen-buttons { height: 1; margin-top: 1; }
+    #reopen-buttons Button { margin-right: 1; }
 
     #discussion-head { height: 1; }
     #discussion-head .caption { width: 1fr; }
@@ -447,7 +459,13 @@ class GrillApp(App):
         self.session = Path(session).resolve()
         self.client = client or Client(session)
         self.state = None
-        self.index = 0
+        # The shown question; None is the waiting screen between rounds.
+        self.qid = None
+        # Question ID per row of the list; '' marks a round header, None the waiting row.
+        self.rows = []
+        self.list_fingerprint = None
+        self.listed = None
+        self.reopen_editing = False
         self.dirty = set()
         self.draft_dirty = set()
         self.api_lock = asyncio.Lock()
@@ -458,7 +476,7 @@ class GrillApp(App):
         self.hide_questions = False
         self.hide_discussion = False
         self.pending_file = self.session / 'tui-pending.json'
-        self.submit_notice = SUBMITTED
+        self.submit_notice = None
         self.catalog = {'ready': False, 'harnesses': {}}
         self.catalog_checked = time.monotonic()
 
@@ -475,21 +493,30 @@ class GrillApp(App):
                 yield Label('Вопросы', classes='caption')
                 yield OptionList(id='question-list')
             with Vertical(id='center'):
-                with VerticalScroll(id='question-scroll'):
-                    yield Static('', id='question-meta')
-                    yield Static('', id='question-title', markup=False)
-                    yield Static('', id='question-body', markup=False)
-                    yield Static('', id='recommendation')
-                    yield ChoiceList(id='choices')
-                    yield Static('↑↓ Enter выбрать · Enter ещё раз подтвердить · Space снять',
-                                 id='choices-hint', classes='hint')
-                with Horizontal(classes='field-head'):
-                    yield Label('Ваш ответ', classes='caption')
-                    yield Static('Enter сохранить · Shift+Enter перенос', classes='hint')
-                yield Composer(id='answer', soft_wrap=True, tab_behavior='focus')
-                with Horizontal(id='answer-actions'):
-                    yield Static('', id='answer-state')
-                    yield Button('Подтвердить ответ', id='confirm', variant='primary', compact=True)
+                yield Static('', id='waiting')
+                with Vertical(id='question-view'):
+                    with VerticalScroll(id='question-scroll'):
+                        yield Static('', id='question-meta')
+                        yield Static('', id='question-title', markup=False)
+                        yield Static('', id='question-body', markup=False)
+                        yield Static('', id='recommendation')
+                        yield ChoiceList(id='choices')
+                        yield Static('↑↓ Enter выбрать · Enter ещё раз подтвердить · Space снять',
+                                     id='choices-hint', classes='hint')
+                    with Horizontal(classes='field-head'):
+                        yield Label('Ваш ответ', classes='caption')
+                        yield Static('Enter сохранить · Shift+Enter перенос', id='answer-hint', classes='hint')
+                    yield Composer(id='answer', soft_wrap=True, tab_behavior='focus')
+                    with Horizontal(id='answer-actions'):
+                        yield Static('', id='answer-state')
+                        yield Button('Подтвердить ответ', id='confirm', variant='primary', compact=True)
+                        yield Button('Пересмотреть', id='reopen', compact=True)
+                    with Vertical(id='reopen-box'):
+                        yield Static('', id='reopen-note', markup=False)
+                        yield Composer(id='reopen-reason', soft_wrap=True, tab_behavior='focus')
+                        with Horizontal(id='reopen-buttons'):
+                            yield Button('Попросить пересмотр', id='reopen-save', variant='primary', compact=True)
+                            yield Button('Отмена', id='reopen-cancel', compact=True)
             with Vertical(id='discussion'):
                 with Horizontal(id='discussion-head'):
                     yield Label('Обсуждение', classes='caption')
@@ -525,83 +552,156 @@ class GrillApp(App):
 
     @property
     def q(self):
-        return self.state['round']['questions'][self.index]
+        return self.locate(self.qid)[2]
+
+    def locate(self, qid):
+        """(round number, round, question) of a question anywhere in the grill."""
+        return next((n, doc, q) for n, doc in enumerate(self.state['rounds'], 1)
+                    for q in doc['questions'] if q['id'] == qid)
+
+    def is_open(self, qid):
+        """Only questions of the open round take answers; sent ones are history."""
+        current = open_round(self.state)
+        return bool(current) and any(q['id'] == qid for q in current['questions'])
+
+    def start_view(self):
+        current = open_round(self.state)
+        self.qid = current['questions'][0]['id'] if current else None
+
+    def focus_answer(self):
+        # Start where the answer goes, never on a button that Enter would press.
+        if self.qid is None:
+            return
+        choices = self.query_one('#choices', ChoiceList)
+        (choices if choices.display and not choices.disabled else self.query_one('#answer')).focus()
+
+    def show_heading(self):
+        self.query_one('#heading', Static).update(Text.assemble(
+            ('Grill', f"bold {PALETTE['accent']}"), ('  ·  ', PALETTE['faint']),
+            (self.state['rounds'][-1]['title'], f"bold {PALETTE['strong']}")))
 
     async def on_mount(self):
         try:
             self.state = await self.api('/api/state')
-            if self.pending_file.exists() and not self.state['submitted']:
+            if self.pending_file.exists():
                 pending = read(self.pending_file)
-                if pending.get('round_id') == self.state['round']['id']:
-                    for qid, answer in pending.get('answers', {}).items():
-                        if qid in self.state['answers']:
-                            self.state['answers'][qid] = answer
-                            self.dirty.add(qid)
-                    for qid, draft in pending.get('drafts', {}).items():
-                        if qid in self.state['branches']:
-                            self.state['branches'][qid]['input_draft'] = draft
-                            self.draft_dirty.add(qid)
-            self.query_one('#heading', Static).update(Text.assemble(
-                ('Grill', f"bold {PALETTE['accent']}"), ('  ·  ', PALETTE['faint']),
-                (self.state['round']['title'], f"bold {PALETTE['strong']}")))
+                for qid, answer in pending.get('answers', {}).items():
+                    if qid in self.state['answers'] and self.is_open(qid):
+                        self.state['answers'][qid] = answer
+                        self.dirty.add(qid)
+                for qid, draft in pending.get('drafts', {}).items():
+                    if qid in self.state['branches']:
+                        self.state['branches'][qid]['input_draft'] = draft
+                        self.draft_dirty.add(qid)
+            self.start_view()
+            self.show_heading()
             self.refresh_list()
             await self.fetch_catalog()
             self.load_question()
             self.apply_layout()
-            # Start where the answer goes, never on a button that Enter would press.
-            choices = self.query_one('#choices', ChoiceList)
-            (choices if choices.display else self.query_one('#answer')).focus()
+            self.focus_answer()
             self.set_interval(.6, self.tick)
             await self.tick()
         except (OSError, ValueError) as exc:
             self.status(f'Не удалось открыть раунд: {exc}. Закройте и повторите open.', error=True)
 
-    async def notify_agent(self):
+    async def notify_agent(self, path):
         """Wake the agent in its own pane; without Herdr the owner does it by hand."""
         if not (self.session / 'herdr.json').exists():
             return SUBMITTED
         try:
             from grill_herdr import notify_agent
             await asyncio.to_thread(notify_agent, self.session)
-            return AGENT_NOTIFIED.format(path=self.session / 'answers.json')
+            return AGENT_NOTIFIED.format(path=path)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             return f'Не удалось написать агенту: {exc}. ' + SUBMITTED
 
     def checkpoint(self):
         # Preserve edits even if the server becomes unreachable before autosave.
-        write(self.pending_file, {'round_id': self.state['round']['id'],
+        write(self.pending_file, {
             'answers': {k: self.state['answers'][k] for k in self.dirty},
             'drafts': {k: self.state['branches'][k].get('input_draft', '') for k in self.draft_dirty}})
 
     def refresh_list(self):
-        listing = self.query_one('#question-list', OptionList)
-        with self.prevent(OptionList.OptionSelected):
-            listing.clear_options()
-            for q in self.state["round"]["questions"]:
+        """All rounds of the grill; a round header is a row that cannot be selected."""
+        numbers, sent, reopen = self.state['numbers'], self.state['submitted_rounds'], self.state['reopen']
+        current = open_round(self.state)
+        waiting = current is None and not self.state['finished']
+        marks = {}
+        for doc in self.state['rounds']:
+            for q in doc['questions']:
                 answer = self.state['answers'][q['id']]
-                if answer['confirmed']:
-                    mark = ('✓', PALETTE['ok'])
+                if q['id'] in reopen:
+                    marks[q['id']] = ('↺', PALETTE['warn'])
+                elif answer['confirmed']:
+                    marks[q['id']] = ('✓', PALETTE['ok'])
                 elif answer['selected'] or answer['text'].strip():
-                    mark = ('◐', PALETTE['warn'])
+                    marks[q['id']] = ('◐', PALETTE['warn'])
                 else:
-                    mark = ('○', PALETTE['faint'])
-                # A grid keeps wrapped titles aligned under the first line.
-                row = Table.grid(padding=(0, 1))
-                row.add_column(width=1)
-                row.add_column(ratio=1)
-                row.add_row(Text(mark[0], style=mark[1]), Text(q['title']))
-                listing.add_option(row)
-            listing.highlighted = self.index
-        total = len(self.state['answers'])
-        count = sum(a['confirmed'] for a in self.state['answers'].values())
-        self.query_one('#progress', Static).update(f'подтверждено {count} из {total}')
+                    marks[q['id']] = ('○', PALETTE['faint'])
+        # The list is rebuilt only when it changes, so the scroll position and hover survive ticks.
+        fingerprint = json.dumps([[d['id'] for d in self.state['rounds']], sent, marks, waiting],
+                                 ensure_ascii=False)
+        listing = self.query_one('#question-list', OptionList)
+        rebuilt = fingerprint != self.list_fingerprint
+        if rebuilt:
+            self.list_fingerprint = fingerprint
+            self.rows = []
+            with self.prevent(OptionList.OptionSelected):
+                listing.clear_options()
+                for n, doc in enumerate(self.state['rounds'], 1):
+                    state = ('отправлен', PALETTE['faint']) if doc['id'] in sent else ('текущий', PALETTE['accent'])
+                    listing.add_option(Option(Text.assemble('\n' if n > 1 else '', (f'Раунд {n}', 'bold'),
+                                                            (' · ', PALETTE['faint']), state), disabled=True))
+                    self.rows.append('')
+                    for q in doc['questions']:
+                        # A grid keeps wrapped titles aligned under the first line.
+                        row = Table.grid(padding=(0, 1))
+                        row.add_column(width=1)
+                        row.add_column(ratio=1)
+                        mark = marks[q['id']]
+                        row.add_row(Text(mark[0], style=mark[1]), Text(f"{numbers[q['id']]}. {q['title']}"))
+                        listing.add_option(row)
+                        self.rows.append(q['id'])
+                if waiting:
+                    listing.add_option(Text.assemble('\n', ('…', PALETTE['accent']), ' ',
+                                                     ('Агент готовит раунд', PALETTE['muted'])))
+                    self.rows.append(None)
+        # The cursor follows the shown question, but a tick never pulls it away from the owner's arrows.
+        if self.qid in self.rows and (rebuilt or self.qid != self.listed):
+            listing.highlighted = self.rows.index(self.qid)
+            self.listed = self.qid
+        if current:
+            ids = [q['id'] for q in current['questions']]
+            progress = f"подтверждено {sum(self.state['answers'][i]['confirmed'] for i in ids)} из {len(ids)}"
+        else:
+            progress = 'grill завершён' if self.state['finished'] else 'ждём следующий раунд'
+        if reopen:
+            progress += f' · пересмотр {len(reopen)}'
+        self.query_one('#progress', Static).update(progress)
 
     def load_question(self):
-        q = self.q
+        self.reopen_editing = False
+        waiting = self.qid is None
+        self.query_one('#question-view').display = not waiting
+        self.query_one('#waiting').display = waiting
+        if waiting:
+            reopen = len(self.state['reopen'])
+            self.query_one('#waiting', Static).update(Text.assemble(
+                ('Grill завершён' if self.state['finished'] else 'Агент готовит следующий раунд…',
+                 f"bold {PALETTE['strong']}"), '\n\n',
+                'Новые вопросы появятся здесь сами. Прошлые вопросы и их чаты доступны в списке слева; '
+                'чтобы вернуться к отправленному ответу, откройте вопрос и нажмите «Пересмотреть».',
+                (f'\n\nЗапросов на пересмотр: {reopen}. Нажмите «Отправить пересмотр».' if reopen else '',
+                 PALETTE['warn'])))
+            self.refresh_controls()
+            return
+        n, doc, q = self.locate(self.qid)
+        live = self.is_open(q['id'])
         answer = self.state['answers'][q['id']]
-        questions = self.state['round']['questions']
         self.query_one('#question-meta', Static).update(
-            f'Вопрос {self.index + 1} из {len(questions)}  ·  {MODES.get(q.get("mode", "single"), "")}')
+            f"Вопрос {self.state['numbers'][q['id']]}  ·  Раунд {n}{'' if live else ' · отправлен'}"
+            f"  ·  {MODES.get(q.get('mode', 'single'), '')}")
         self.query_one('#question-title', Static).update(q['title'])
         self.query_one('#question-body', Static).update(q['body'])
         self.query_one('#recommendation', Static).update(Text.assemble(
@@ -611,9 +711,15 @@ class GrillApp(App):
             choices.load(q.get('options', []), answer['selected'], q.get('mode', 'single'),
                          q.get('recommended', []))
             choices.display = q.get('mode') != 'text' and bool(q.get('options'))
-            self.query_one('#choices-hint').display = choices.display
-            self.query_one('#answer', TextArea).load_text(answer['text'])
+            # A sent answer stays visible as history; only a new round asks again.
+            choices.disabled = not live
+            self.query_one('#choices-hint').display = choices.display and live
+            self.query_one('#answer-hint').display = live
+            editor = self.query_one('#answer', TextArea)
+            editor.read_only = not live
+            editor.load_text(answer['text'])
             self.query_one('#message', TextArea).load_text(self.state['branches'][q['id']].get('input_draft', ''))
+            self.query_one('#reopen-reason', TextArea).load_text('')
         self.query_one('#question-scroll').scroll_home(animate=False)
         self.chat_fingerprint = None
         self.refresh_chat()
@@ -621,29 +727,59 @@ class GrillApp(App):
         self.refresh_controls()
 
     def refresh_controls(self):
-        submitted = self.state['submitted']
-        running = self.state['branches'][self.q['id']]['status'] == 'running'
-        for ident in ('answer', 'message', 'choices', 'confirm', 'submit', 'insert', 'summarize', 'send'):
-            self.query_one('#' + ident).disabled = submitted
-        self.query_one('#send').disabled = submitted or running
-        self.query_one('#summarize').disabled = submitted or running
-        self.query_one('#stop').disabled = submitted or not running
-        self.query_one('#return', Button).variant = 'success' if submitted else 'default'
-        self.query_one('#agent-picker').disabled = submitted
-        answer = self.state['answers'][self.q['id']]
+        finished = self.state['finished']
+        current = open_round(self.state)
+        reopen = self.state['reopen']
+        submit = self.query_one('#submit', Button)
+        # With no open round the button still sends the owner's reopen requests alone.
+        submit.label = 'Отправить все ответы' if current or not reopen else 'Отправить пересмотр'
+        submit.disabled = finished or not (current or reopen)
+        self.query_one('#return', Button).variant = 'success' if current is None else 'default'
+        if self.qid is None:
+            return
+        qid = self.qid
+        live = self.is_open(qid)
+        running = self.state['branches'][qid]['status'] == 'running'
+        # Chats of sent questions go on; they close only when the grill is finished.
+        self.query_one('#message').disabled = finished
+        self.query_one('#send').disabled = finished or running
+        self.query_one('#summarize').disabled = finished or running
+        self.query_one('#stop').disabled = finished or not running
+        self.query_one('#agent-picker').disabled = finished
+        answer = self.state['answers'][qid]
         self.query_one('#answer').set_class(bool(answer['text'].strip()), '-filled')
         confirmed = answer['confirmed']
-        self.query_one('#confirm', Button).label = 'Подтверждено ✓' if confirmed else 'Подтвердить ответ'
+        confirm = self.query_one('#confirm', Button)
+        confirm.display = live
+        confirm.label = 'Подтверждено ✓' if confirmed else 'Подтвердить ответ'
+        pending = reopen.get(qid)
+        self.query_one('#reopen').display = not live and not pending and not self.reopen_editing
+        self.query_one('#reopen').disabled = finished
+        box = self.query_one('#reopen-box')
+        box.display = not live and bool(pending or self.reopen_editing)
+        self.query_one('#reopen-note').display = bool(pending) and not self.reopen_editing
+        self.query_one('#reopen-note', Static).update(
+            f'Запрошен пересмотр: {pending}\nУйдёт агенту со следующей отправкой.' if pending else '')
+        self.query_one('#reopen-reason').display = self.reopen_editing
+        self.query_one('#reopen-save').display = self.reopen_editing
+        cancel = self.query_one('#reopen-cancel', Button)
+        cancel.label = 'Отмена' if self.reopen_editing else 'Отменить пересмотр'
+        cancel.disabled = finished
         state = self.query_one('#answer-state', Static)
-        state.set_class(confirmed, '-confirmed')
-        state.update('Ответ подтверждён' if confirmed else
-                     'Черновик, не подтверждён' if answer['selected'] or answer['text'].strip() else 'Ответа пока нет')
+        state.set_class(confirmed and live, '-confirmed')
+        if not live:
+            state.update(f'Отправлен в раунде {self.locate(qid)[0]}')
+        else:
+            state.update('Ответ подтверждён' if confirmed else
+                         'Черновик, не подтверждён' if answer['selected'] or answer['text'].strip() else 'Ответа пока нет')
 
     def chat_runtime(self):
         branch = self.state['branches'][self.q['id']]
         return branch['runtime'] if branch.get('thread_id') and branch.get('runtime') else self.state['runtime']
 
     def refresh_chat(self):
+        if self.qid is None:
+            return
         branch = self.state['branches'][self.q['id']]
         fingerprint = json.dumps(branch.get('messages', []), ensure_ascii=False)
         if fingerprint != self.chat_fingerprint:
@@ -673,7 +809,8 @@ class GrillApp(App):
         summary = branch.get('summary', '')
         self.query_one('#draft', Static).update(summary)
         self.query_one('#draft').display = bool(summary)
-        self.query_one('#draft-buttons').display = bool(summary)
+        # A sent answer is history: its chat drafts, but nothing goes into the answer.
+        self.query_one('#draft-buttons').display = bool(summary) and self.is_open(self.qid)
 
     async def flush(self):
         for qid in list(self.dirty):
@@ -692,27 +829,44 @@ class GrillApp(App):
         if not self.state:
             return
         try:
-            if not self.state['submitted']:
-                await self.flush()
+            await self.flush()
             latest = await self.api('/api/state')
+            added = len(latest['rounds']) > len(self.state['rounds'])
             for qid, branch in latest['branches'].items():
-                draft = self.state['branches'][qid].get('input_draft', '')
+                # The message field is the owner's until it reaches the server.
+                if qid in self.state['branches']:
+                    branch['input_draft'] = self.state['branches'][qid].get('input_draft', '')
                 self.state['branches'][qid] = branch
-                self.state['branches'][qid]['input_draft'] = draft
-            self.state['submitted'] = latest['submitted']
-            self.state['runtime'] = latest['runtime']
+            for qid, answer in latest['answers'].items():
+                if qid not in self.dirty:
+                    self.state['answers'][qid] = answer
+            for key in ('rounds', 'submitted_rounds', 'submissions', 'reopen', 'numbers', 'finished', 'runtime'):
+                self.state[key] = latest[key]
+            if added:
+                # The agent added the next round to this tab: go to its first question.
+                self.submit_notice = None
+                self.start_view()
+                self.show_heading()
+                self.show_question(self.qid)
+                self.focus_answer()
+                self.notify(self.state['rounds'][-1]['title'], title=f"Раунд {len(self.state['rounds'])}", timeout=10)
             if not self.catalog.get('ready') and time.monotonic() - self.catalog_checked > 5:
                 # The server lists models in the background; pick them up once ready.
                 self.catalog_checked = time.monotonic()
                 await self.fetch_catalog()
                 if self.catalog.get('ready'):
                     self.sync_picker()
+            self.refresh_list()
             self.refresh_chat()
             self.refresh_controls()
-            if self.state['submitted']:
-                self.status(self.submit_notice)
+            current = open_round(self.state)
+            if self.state['finished']:
+                self.status(FINISHED)
+            elif current is None:
+                self.status(self.submit_notice or WAITING)
             elif not self.dirty and not self.draft_dirty:
-                self.status(ALL_CONFIRMED if all(a['confirmed'] for a in self.state['answers'].values())
+                ids = [q['id'] for q in current['questions']]
+                self.status(ALL_CONFIRMED if all(self.state['answers'][i]['confirmed'] for i in ids)
                             else 'Сохранено. Когда ответите на все вопросы, нажмите «Отправить все ответы».')
         except (OSError, ValueError) as exc:
             self.status(f'Нет сохранения на сервере: {exc}. Черновики сохранены локально; сообщения повторно не отправляются.',
@@ -722,12 +876,12 @@ class GrillApp(App):
 
     @on(TextArea.Changed)
     def edited(self, event):
-        if not self.state or self.state['submitted']:
+        if not self.state or self.qid is None:
             return
-        qid = self.q['id']
+        qid = self.qid
         if event.text_area.id == 'answer':
             answer = self.state['answers'][qid]
-            if answer['text'] == event.text_area.text:
+            if not self.is_open(qid) or answer['text'] == event.text_area.text:
                 return
             answer.update(text=event.text_area.text, confirmed=False)
             self.dirty.add(qid)
@@ -735,10 +889,12 @@ class GrillApp(App):
             self.refresh_controls()
         elif event.text_area.id == 'message':
             branch = self.state['branches'][qid]
-            if branch.get('input_draft', '') == event.text_area.text:
+            if self.state['finished'] or branch.get('input_draft', '') == event.text_area.text:
                 return
             branch['input_draft'] = event.text_area.text
             self.draft_dirty.add(qid)
+        else:
+            return  # A reopen reason lives only in its field until the owner saves the request.
         self.checkpoint()
         self.status('Сохраняю…')
 
@@ -746,6 +902,8 @@ class GrillApp(App):
     async def composer_submitted(self, event):
         if event.composer.id == 'answer':
             await self.confirm_and_advance()
+        elif event.composer.id == 'reopen-reason':
+            await self.request_reopen()
         else:
             self.query_one('#send', Button).press()
 
@@ -754,36 +912,36 @@ class GrillApp(App):
         await self.confirm_and_advance()
 
     async def confirm_and_advance(self):
-        """Enter: confirm a non-empty answer and move to the next unconfirmed question."""
-        if not self.state or self.state['submitted']:
+        """Enter: confirm a non-empty answer and move to the next unconfirmed question of the open round."""
+        if not self.state or self.qid is None or not self.is_open(self.qid):
             return
-        answer = self.state['answers'][self.q['id']]
+        answer = self.state['answers'][self.qid]
         if not answer['selected'] and not answer['text'].strip():
             return  # Nothing chosen or written: Enter does nothing.
         await self.action_confirm()
-        if not answer['confirmed']:
+        if not self.state['answers'][self.qid]['confirmed']:
             return
-        questions = self.state['round']['questions']
-        order = questions[self.index + 1:] + questions[:self.index]
+        questions = open_round(self.state)['questions']
+        index = next(i for i, q in enumerate(questions) if q['id'] == self.qid)
+        order = questions[index + 1:] + questions[:index]
         pending = next((q for q in order if not self.state['answers'][q['id']]['confirmed']), None)
         if pending is None:
             self.query_one('#submit', Button).focus()
             self.status(ALL_CONFIRMED)
             return
-        self.show_question(questions.index(pending))
-        choices = self.query_one('#choices', ChoiceList)
-        (choices if choices.display else self.query_one('#answer')).focus()
+        self.show_question(pending['id'])
+        self.focus_answer()
 
-    def show_question(self, index):
-        self.index = index
+    def show_question(self, qid):
+        self.qid = qid
         self.load_question()
-        self.query_one('#question-list', OptionList).highlighted = index
+        self.refresh_list()
         self.compact_view = 'center'
         self.apply_layout()
 
     @on(ChoiceList.Toggled)
     def selected(self, event):
-        if not self.state or self.state['submitted']:
+        if not self.state or self.qid is None or not self.is_open(self.qid):
             return
         choices = event.choices
         self.state['answers'][self.q['id']].update(selected=list(choices.selected), confirmed=False)
@@ -794,16 +952,16 @@ class GrillApp(App):
 
     @on(OptionList.OptionSelected, '#question-list')
     async def question_selected(self, event):
-        if not self.state:
+        if not self.state or self.rows[event.option_index] == '':
             return
         try:
             await self.flush()
         except (OSError, ValueError) as exc:
             self.status(f'Черновик сохранён локально: {exc}', error=True)
-        self.show_question(event.option_index)
+        self.show_question(self.rows[event.option_index])
 
     async def action_confirm(self):
-        if not self.state or self.state['submitted']:
+        if not self.state or self.qid is None or not self.is_open(self.qid):
             return
         answer = self.state['answers'][self.q['id']]
         if not answer['selected'] and not answer['text'].strip():
@@ -819,6 +977,24 @@ class GrillApp(App):
             self.status('Ответ подтверждён. Перейдите к следующему вопросу.')
         except (OSError, ValueError) as exc:
             self.status(f'Подтверждение пока не сохранено на сервере: {exc}', error=True)
+
+    async def request_reopen(self):
+        """Save the owner's reason; the request goes to the agent with the next submit."""
+        reason = self.query_one('#reopen-reason', TextArea).text.strip()
+        if not reason:
+            self.status('Напишите, почему ответ нужно пересмотреть.')
+            return
+        try:
+            await self.api('/api/reopen', {'question_id': self.qid, 'reason': reason})
+        except (OSError, ValueError) as exc:
+            self.status(f'Запрос не сохранён: {exc}', error=True)
+            return
+        self.state['reopen'][self.qid] = reason
+        self.reopen_editing = False
+        self.refresh_list()
+        self.refresh_controls()
+        self.status('Запрос на пересмотр уйдёт агенту со следующей отправкой.' if open_round(self.state)
+                    else 'Нажмите «Отправить пересмотр», чтобы агент получил запрос.')
 
     @on(Button.Pressed)
     async def pressed(self, event):
@@ -843,20 +1019,40 @@ class GrillApp(App):
                 await asyncio.to_thread(return_to_agent, self.session)
             elif ident == 'submit':
                 await self.flush()
-                await self.api('/api/submit', {})
-                self.state['submitted'] = True
-                self.refresh_controls()
-                self.submit_notice = await self.notify_agent()
+                result = await self.api('/api/submit', {})
+                self.submit_notice = await self.notify_agent(result['file'])
+                # Sent answers become history; the center waits for the agent's next round.
+                self.qid = None
+                await self.tick()
+                self.load_question()
+                self.apply_layout()
                 self.status(self.submit_notice)
-                self.notify(self.submit_notice, title='Ответы отправлены', timeout=30)
+                self.notify(self.submit_notice, timeout=30,
+                            title='Ответы отправлены' if result['round_id'] else 'Пересмотр отправлен')
                 self.query_one('#return', Button).focus()
                 if (self.session / 'herdr.json').exists():
-                    # The round is read-only now and the agent is already working: go there.
+                    # The agent is already working: go there.
                     try:
                         from grill_herdr import return_to_agent
                         await asyncio.to_thread(return_to_agent, self.session)
                     except (OSError, ValueError, subprocess.SubprocessError) as exc:
                         self.status(f'{self.submit_notice} Не удалось переключиться на агента: {exc}', error=True)
+            elif ident == 'reopen':
+                self.reopen_editing = True
+                self.refresh_controls()
+                # The pressed button hides itself; focus the reason once the form is laid out.
+                self.call_after_refresh(self.query_one('#reopen-reason').focus)
+            elif ident == 'reopen-save':
+                await self.request_reopen()
+            elif ident == 'reopen-cancel':
+                if self.reopen_editing:
+                    self.reopen_editing = False
+                else:
+                    await self.api('/api/reopen', {'question_id': self.qid, 'reason': None})
+                    self.state['reopen'].pop(self.qid, None)
+                    self.status('Запрос на пересмотр отменён.')
+                self.refresh_list()
+                self.refresh_controls()
             elif ident in ('send', 'summarize'):
                 await self.flush()
                 qid = self.q['id']
@@ -874,7 +1070,7 @@ class GrillApp(App):
                 await self.api('/api/stop', {'question_id': self.q['id']})
             elif ident == 'insert':
                 summary = self.state['branches'][self.q['id']].get('summary')
-                if summary:
+                if summary and self.is_open(self.qid):
                     editor = self.query_one('#answer', TextArea)
                     # Append instead of silently replacing the owner's existing text.
                     editor.load_text((editor.text.rstrip() + '\n\n' + summary).strip())
@@ -892,6 +1088,8 @@ class GrillApp(App):
             self.status(f'Список моделей недоступен: {exc}', error=True)
 
     def sync_picker(self):
+        if self.qid is None:
+            return
         branch = self.state['branches'][self.q['id']]
         chat = branch['runtime'] if branch.get('thread_id') else None
         parent = self.state.get('parent_runtime', self.state['runtime'])
@@ -899,6 +1097,8 @@ class GrillApp(App):
 
     async def action_agent(self):
         """F5: move to the agent controls of the discussion panel."""
+        if self.qid is None:
+            return
         self.compact_view = 'discussion'
         self.hide_discussion = False
         self.expanded_chat = False
@@ -907,7 +1107,7 @@ class GrillApp(App):
 
     @on(AgentPicker.Changed)
     async def agent_changed(self, event):
-        if not self.state or self.state['submitted']:
+        if not self.state or self.state['finished'] or self.qid is None:
             return
         try:
             await self.api('/api/runtime', {'question_id': self.q['id'], 'runtime': event.runtime,
@@ -924,6 +1124,8 @@ class GrillApp(App):
             self.status(f'Настройки не применены: {exc}', error=True)
 
     def action_answer_field(self):
+        if self.qid is None:
+            return
         self.compact_view = 'center'
         self.expanded_chat = False
         self.apply_layout()
@@ -933,6 +1135,8 @@ class GrillApp(App):
         editor.focus()
 
     def action_message_field(self):
+        if self.qid is None:
+            return
         self.compact_view = 'discussion'
         self.hide_discussion = False
         self.apply_layout()
@@ -968,11 +1172,15 @@ class GrillApp(App):
         # Wide screens show every column; the view toggles only matter when narrow.
         for ident in ('toggle-questions', 'toggle-chat'):
             self.query_one('#' + ident).display = narrow
-        hidden = {'questions': self.hide_questions, 'center': False, 'discussion': self.hide_discussion}
+        # The waiting screen has no question, so there is no chat to show beside it.
+        waiting = self.state is not None and self.qid is None
+        view = 'center' if waiting and self.compact_view == 'discussion' else self.compact_view
+        expanded = self.expanded_chat and not waiting
+        hidden = {'questions': self.hide_questions, 'center': False, 'discussion': self.hide_discussion or waiting}
         for name in ('questions', 'center', 'discussion'):
-            self.query_one('#' + name).display = name == self.compact_view if narrow else (
-                name == 'discussion' if self.expanded_chat else not hidden[name])
-        self.query_one('#discussion').styles.width = '100%' if self.expanded_chat or narrow else '34%'
+            self.query_one('#' + name).display = name == view if narrow else (
+                name == 'discussion' if expanded else not hidden[name])
+        self.query_one('#discussion').styles.width = '100%' if expanded or narrow else '34%'
 
     async def action_leave(self):
         if self.state:

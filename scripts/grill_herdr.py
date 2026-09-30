@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install, open, wait for and finish one Grill tab on the agent's Herdr server."""
+"""Install, open, wait for and finish the Grill tab of one grill on the agent's Herdr server."""
 import argparse
 import fcntl
 import hashlib
@@ -14,7 +14,7 @@ import sys
 import time
 from contextlib import contextmanager
 from grill_client import Client
-from grill_ui import read, write, require
+from grill_ui import load_state, offline, read, require, summary, write
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share'))) / 'grill-ui'
@@ -112,7 +112,7 @@ def owned_pane(owner, env):
 
 def open_tab(args):
     session = Path(args.session).resolve()
-    require((session / 'state.json').is_file(), 'Initialize the round first')
+    require((session / 'state.json').is_file(), 'Initialize the grill first')
     require(PYTHON.exists(), 'Run grill_herdr.py install on this host first')
     # Fail before opening a tab if the environment is incomplete.
     subprocess.run([str(PYTHON), '-c', 'import textual'], check=True, capture_output=True)
@@ -122,8 +122,8 @@ def open_tab(args):
         owner = read(path) if path.exists() else caller
         require(owner['host'] == caller['host'] and owner['socket'] == caller['socket']
                 and owner['workspace'] == caller['workspace'],
-                'Round belongs to a different Herdr server/workspace')
-        require(not owner.get('finished'), 'This round is finished; create a new round')
+                'Grill belongs to a different Herdr server/workspace')
+        require(not owner.get('finished'), 'This grill is finished; start a new one')
         env = owner_env(owner)
         ensure_server(session)
         if owner.get('tab') and tab_present(owner, env):
@@ -167,8 +167,9 @@ def open_tab(args):
 
 def finish(args):
     session = Path(args.session).resolve()
-    require((session / 'answers.json').is_file(), 'No submitted answers; leave the tab open')
-    require(read(session / 'status.json')['submitted'], 'Round has not been submitted')
+    # Called once, after the owner confirmed the final picture; an open round keeps the tab.
+    status = summary(load_state(session), session)
+    require(status['submitted'], 'The latest round has not been submitted; leave the tab open')
     with locked(session):
         owner = read(session / 'herdr.json')
         if owner.get('finished'):
@@ -188,12 +189,15 @@ def finish(args):
         client = Client(session)
         if client.healthy():
             client.request('/api/shutdown', {})
+        else:
+            with offline(session) as store:
+                store.finish()
         owner['finished'] = True
         write(session / 'herdr.json', owner)
         registry = DATA / 'active' / (registry_key(owner) + '.json')
         if registry.exists() and read(registry).get('session') == str(session):
             registry.unlink()
-        print(json.dumps({'finished': True, 'answers_file': str(session / 'answers.json')}))
+        print(json.dumps({'finished': True, 'result_file': status['result_file']}, ensure_ascii=False))
 
 
 def agent_pane(session):
@@ -210,8 +214,8 @@ def return_to_agent(session):
 
 
 def submit_notice(session):
-    # The path lets the owner open the exact file the agent is about to read.
-    return f'{SUBMIT_NOTICE}. Файл: {Path(session).resolve() / "answers.json"}'
+    # Only the newest result file: the agent reads what changed, and the owner can open it too.
+    return f'{SUBMIT_NOTICE}. Файл: {read(Path(session) / "status.json")["result_file"]}'
 
 
 def notify_agent(session):

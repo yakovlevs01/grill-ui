@@ -24,6 +24,18 @@ def parentless_env(**extra):
     return patch.dict(os.environ, env, clear=True)
 
 
+def next_round(round_id='r2', ids=('Q4', 'Q5'), depends_on=('Q1',)):
+    """A follow-up round; its questions may depend on answers of earlier rounds."""
+    return {'id': round_id, 'title': 'Уточнения', 'goal': 'Уточнить хранение.', 'context': 'После первого раунда.',
+            'questions': [{'id': qid, 'title': 'Вопрос ' + qid, 'body': 'Тело ' + qid, 'recommendation': 'Совет',
+                           'context': 'Факты ' + qid, 'mode': 'text', 'depends_on': list(depends_on)} for qid in ids]}
+
+
+def answer_all(store, text='Ответ'):
+    for qid in [q['id'] for q in store.state['rounds'][-1]['questions']]:
+        store.answer(qid, {'selected': [], 'text': text, 'confirmed': True})
+
+
 def fake_cli(folder, name, body):
     cli = Path(folder) / name
     cli.write_text('#!' + sys.executable + '\n' + body)
@@ -36,11 +48,7 @@ class RoundTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.doc = g.read(g.ASSETS / 'example-round.json')
-        state = {'round': self.doc, 'runtime': {'model': 'test-model', 'effort': 'high'},
-                 'cwd': str(self.root), 'submitted': False,
-                 'answers': {q['id']: {'selected': [], 'text': '', 'confirmed': False} for q in self.doc['questions']},
-                 'branches': {q['id']: {'thread_id': None, 'messages': [], 'status': 'idle', 'summary': '', 'error': None} for q in self.doc['questions']}}
-        g.write(self.root / 'state.json', state)
+        g.write(self.root / 'state.json', g.new_state(self.doc, {'model': 'test-model', 'effort': 'high'}, str(self.root)))
         self.store = g.Store(self.root)
 
     def tearDown(self):
@@ -200,12 +208,127 @@ print(json.dumps({'models': [
             for qid in self.store.state['answers']:
                 request('/api/answer', {'question_id':qid,'selected':[],'text':'<script>literal</script>','confirmed':True})
             first = json.loads(request('/api/submit', {})[1])
-            second = json.loads(request('/api/submit', {})[1])
-            self.assertEqual(first, second)
             self.assertEqual(first['answers'][0]['text'], '<script>literal</script>')
+            self.assertEqual(Path(first['file']), self.root.resolve() / 'submissions/0001.json')
+            # Nothing new to send: a second press must not produce a second result.
+            with self.assertRaises(urllib.error.HTTPError) as exc:
+                request('/api/submit', {})
+            exc.exception.close()
+            # add-round reaches the live server, so the open TUI switches without a restart.
+            doc = self.root / 'r2.json'
+            g.write(doc, next_round())
+            added = subprocess.run([sys.executable, str(Path(g.__file__)), 'add-round', '--session', str(self.root),
+                                    '--round', str(doc)], capture_output=True, text=True, timeout=10)
+            self.assertEqual(added.returncode, 0, added.stderr)
+            self.assertTrue(json.loads(added.stdout)['live'])
+            state = json.loads(request('/api/state')[1])
+            self.assertEqual([r['id'] for r in state['rounds']], ['demo-r1', 'r2'])
+            self.assertEqual(state['numbers']['Q4'], 4)
         finally:
             proc.send_signal(signal.SIGTERM)
             proc.communicate(timeout=5)
+
+    def test_rounds_share_one_session_with_global_numbers(self):
+        with self.assertRaisesRegex(ValueError, 'Submit the current round'):
+            self.store.add_round(next_round())
+        # The owner's agent choice (F5) must survive new rounds.
+        self.store.state['runtime'].update(model='owner-pick', source='owner choice')
+        answer_all(self.store)
+        first = self.store.submit()
+        for doc, message in ((next_round('demo-r1', ('Q9',)), 'Duplicate round'),
+                             (next_round(ids=('Q2',)), 'unique across the grill'),
+                             (next_round(depends_on=('Q4',)), 'dependent')):
+            with self.assertRaisesRegex(ValueError, message):
+                self.store.add_round(doc)
+        self.store.add_round(next_round())
+        self.assertEqual(self.store.state['runtime']['model'], 'owner-pick')
+        self.assertEqual(self.store.snapshot()['numbers'], {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4, 'Q5': 5})
+        self.assertIn('После первого раунда', self.store.context('Q4'))
+        self.assertIn('Бюджет времени', self.store.context('Q1'))
+        with self.assertRaisesRegex(ValueError, 'already submitted'):
+            self.store.answer('Q1', {'selected': [], 'text': 'Позже', 'confirmed': True})
+        answer_all(self.store, 'Второй')
+        second = self.store.submit()
+        # Each submit is its own file with only its own round; earlier files stay as they were.
+        self.assertEqual([a['question_id'] for a in second['answers']], ['Q4', 'Q5'])
+        self.assertEqual([a['number'] for a in second['answers']], [4, 5])
+        self.assertEqual(g.read(first['file'])['round_id'], 'demo-r1')
+        self.assertEqual(Path(second['file']).name, '0002.json')
+        status = g.read(self.root / 'status.json')
+        self.assertEqual((status['round_id'], status['submitted'], status['waiting'], status['result_file']),
+                         ('r2', True, True, second['file']))
+
+    def test_reopen_goes_with_next_round_or_alone(self):
+        with self.assertRaisesRegex(ValueError, 'sent answer'):
+            self.store.reopen('Q1', 'Передумал')
+        answer_all(self.store)
+        self.store.submit()
+        with self.assertRaisesRegex(ValueError, 'Explain'):
+            self.store.reopen('Q1', '  ')
+        self.store.reopen('Q1', 'Нужен телефон')
+        self.store.reopen('Q1', None)
+        self.assertEqual(self.store.state['reopen'], {})
+        self.store.reopen('Q2', ' Теги всё-таки нужны ')
+        self.assertEqual(g.read(self.root / 'status.json')['reopen'], 1)
+        self.store.add_round(next_round())
+        answer_all(self.store)
+        with_round = self.store.submit()
+        self.assertEqual(with_round['reopen'], [{'question_id': 'Q2', 'number': 2, 'round_id': 'demo-r1',
+                                                 'reason': 'Теги всё-таки нужны'}])
+        self.assertEqual(self.store.state['reopen'], {})
+        with self.assertRaisesRegex(ValueError, 'Nothing to submit'):
+            self.store.submit()
+        # While the agent prepares the next round, the requests go alone.
+        self.store.reopen('Q4', 'Новые факты')
+        alone = self.store.submit()
+        self.assertEqual((alone['round_id'], alone['answers'], [r['number'] for r in alone['reopen']]), (None, [], [4]))
+        self.assertEqual(Path(alone['file']).name, '0003.json')
+        self.assertEqual(g.read(with_round['file'])['reopen'][0]['question_id'], 'Q2')
+
+    def test_past_chats_continue_until_finish(self):
+        answer_all(self.store)
+        self.store.submit()
+        self.store.draft('Q1', 'Ещё вопрос')
+        with patch.dict(os.environ, {'PATH': str(self.root) + os.pathsep + os.environ['PATH']}):
+            fake_cli(self.root, 'codex', 'pass\n')
+            self.store.set_runtime({'harness': 'codex', 'model': 'test-model', 'effort': 'low'}, 'Q1', restart=True)
+        self.store.finish()
+        for action in (lambda: self.store.draft('Q1', 'x'), lambda: self.store.start('Q1', 'x'),
+                       lambda: self.store.reopen('Q1', 'x'), lambda: self.store.add_round(next_round())):
+            with self.assertRaisesRegex(ValueError, 'finished'):
+                action()
+        self.assertFalse(g.read(self.root / 'status.json')['waiting'])
+
+    def test_single_round_session_migrates(self):
+        state = g.read(self.root / 'state.json')
+        doc = state.pop('rounds')[0]
+        for key in ('submitted_rounds', 'submissions', 'reopen', 'finished'):
+            state.pop(key)
+        state.update(round=doc, submitted=True)
+        g.write(self.root / 'state.json', state)
+        g.write(self.root / 'answers.json', {'round_id': doc['id'], 'submitted_at': 0, 'answers': []})
+        status = subprocess.run([sys.executable, str(Path(g.__file__)), 'status', '--session', str(self.root)],
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(status.stdout)['result_file'], str(self.root.resolve() / 'answers.json'))
+        doc2 = self.root / 'r2.json'
+        g.write(doc2, next_round())
+        # No server runs: add-round updates the state under the session lock.
+        added = subprocess.run([sys.executable, str(Path(g.__file__)), 'add-round', '--session', str(self.root),
+                                '--round', str(doc2)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(added.returncode, 0, added.stderr)
+        self.assertFalse(json.loads(added.stdout)['live'])
+        store = g.Store(self.root)
+        self.assertEqual((store.state['submitted_rounds'], [r['id'] for r in store.state['rounds']]),
+                         (['demo-r1'], ['demo-r1', 'r2']))
+        answer_all(store)
+        self.assertEqual(Path(store.submit()['file']).name, '0002.json')
+
+    def test_offline_update_refused_while_a_server_holds_the_session(self):
+        with (self.root / 'server.lock').open('a') as lock:
+            g.fcntl.flock(lock, g.fcntl.LOCK_EX)
+            with self.assertRaisesRegex(ValueError, 'does not answer'):
+                with g.offline(self.root):
+                    pass
 
     def test_activity_phrases_from_cli_events(self):
         codex, claude = harness.HARNESSES['codex'], harness.HARNESSES['claude']

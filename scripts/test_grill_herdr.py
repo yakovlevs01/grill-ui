@@ -48,6 +48,9 @@ class OwnershipTests(unittest.TestCase):
     def test_notice_goes_only_to_owned_agent_pane(self):
         with tempfile.TemporaryDirectory() as tmp:
             h.write(Path(tmp)/'herdr.json', {'parent_pane': 'w1:p1', 'parent_terminal': 'term-a'})
+            # The notice names only the newest result file, never an earlier round's.
+            newest = str(Path(tmp).resolve() / 'submissions/0002.json')
+            h.write(Path(tmp)/'status.json', {'submitted': True, 'result_file': newest})
             pane = {'pane_id': 'w1:p1', 'tab_id': 'w1:t1', 'terminal_id': 'term-a'}
             calls = []
             def fake(args, env=None):
@@ -56,7 +59,7 @@ class OwnershipTests(unittest.TestCase):
             with patch.object(h, 'owner_env', return_value={}), patch.object(h, 'herdr', fake), \
                  patch.object(h.time, 'sleep'):
                 h.notify_agent(tmp)
-                notice = h.SUBMIT_NOTICE + '. Файл: ' + str(Path(tmp).resolve() / 'answers.json')
+                notice = h.SUBMIT_NOTICE + '. Файл: ' + newest
                 self.assertEqual(calls[1:], [['pane', 'send-text', 'w1:p1', notice],
                                              ['pane', 'send-keys', 'w1:p1', 'enter']])
                 pane['terminal_id'] = 'term-b'
@@ -74,8 +77,24 @@ class OwnershipTests(unittest.TestCase):
                 f.store.answer(qid, {'selected': ['local'] if qid=='Q1' else [],
                                     'text': 'Принято', 'confirmed':True})
             result = f.store.submit()
-            self.assertEqual(result['answers'][0], {'question_id':'Q1','selected':['local'],'text':'Принято'})
+            self.assertEqual(result['answers'][0], {'question_id':'Q1','number':1,'selected':['local'],'text':'Принято'})
             self.assertTrue(h.read(f.root/'status.json')['submitted'])
+        finally:
+            f.tearDown()
+
+    def test_finish_waits_for_the_latest_round(self):
+        import test_grill_ui
+        f = test_grill_ui.RoundTests()
+        f.setUp()
+        try:
+            test_grill_ui.answer_all(f.store)
+            f.store.submit()
+            f.store.add_round(test_grill_ui.next_round())
+            # The tab stays for the open round; nothing in Herdr is touched.
+            with patch.object(h, 'herdr') as herdr:
+                with self.assertRaisesRegex(ValueError, 'latest round'):
+                    h.finish(h.argparse.Namespace(session=str(f.root)))
+            herdr.assert_not_called()
         finally:
             f.tearDown()
 

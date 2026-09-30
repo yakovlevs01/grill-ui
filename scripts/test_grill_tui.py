@@ -6,10 +6,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 from rich.console import Console
-from textual.widgets import Button, Input, Select, TextArea
+from textual.widgets import Button, Input, OptionList, Select, TextArea
 import grill_ui as g
 from grill_tui import ChoiceList, GrillApp, CUSTOM
 import test_grill_ui
+
+
+def plain(renderable):
+    lines = Console(width=60, color_system=None).render_lines(renderable, pad=False)
+    return '\n'.join(''.join(segment.text for segment in line) for line in lines)
 
 CATALOG = {'ready': True, 'harnesses': {
     'codex': {'label': 'Codex', 'available': True, 'efforts': ['low', 'high'],
@@ -28,11 +33,13 @@ class LocalAPI:
             raise OSError('offline')
         qid = (data or {}).get('question_id')
         if path == '/api/state':
-            return copy.deepcopy(self.store.state)
+            return self.store.snapshot()
         if path == '/api/answer':
             self.store.answer(qid, data)
         elif path == '/api/draft':
             self.store.draft(qid, data['text'])
+        elif path == '/api/reopen':
+            self.store.reopen(qid, data.get('reason'))
         elif path == '/api/submit':
             return self.store.submit()
         elif path == '/api/catalog':
@@ -143,11 +150,17 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             await pilot.click('#confirm')
             await pilot.click('#submit')
             await pilot.pause()
-            result = g.read(self.fixture.root/'answers.json')
+            result = g.read(g.read(self.fixture.root/'status.json')['result_file'])
             self.assertEqual(len(result['answers']), 3)
             self.assertNotIn('Отдельный ответ', str(result))
             self.assertNotIn('question', result['answers'][0])
-            self.assertTrue(app.query_one('#answer').disabled)
+            # Between rounds the center waits for the agent; the list keeps the sent questions.
+            self.assertIsNone(app.qid)
+            self.assertTrue(app.query_one('#waiting').display)
+            self.assertFalse(app.query_one('#question-view').display)
+            self.assertFalse(app.query_one('#discussion').display)
+            self.assertIn('Агент готовит', str(app.query_one('#waiting').render()))
+            self.assertTrue(app.query_one('#submit').disabled)
             back = app.query_one('#return', Button)
             self.assertIs(app.focused, back)
             self.assertEqual(back.variant, 'success')
@@ -228,7 +241,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         g.write(self.fixture.root/'herdr.json', {})
         for effect, expected in ((None, 'агент получил «Готово»'),
                                  (ValueError('Original agent terminal is gone'), 'Не удалось написать агенту')):
-            self.store.state['submitted'] = False
+            self.store.state['submitted_rounds'] = []
             app = GrillApp(self.fixture.root, self.api)
             with patch.object(grill_herdr, 'notify_agent', side_effect=effect) as notify, \
                  patch.object(grill_herdr, 'return_to_agent') as back:
@@ -239,6 +252,8 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                     notify.assert_called_once_with(self.fixture.root.resolve())
                     back.assert_called_once_with(self.fixture.root.resolve())
                     self.assertIn(expected, app.submit_notice)
+                    if effect is None:
+                        self.assertIn(g.read(self.fixture.root/'status.json')['result_file'], app.submit_notice)
                     self.assertIs(app.focused, app.query_one('#return', Button))
 
     async def test_offline_recovery_switching_and_narrow_layout(self):
@@ -326,7 +341,130 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             await pilot.click('#insert')
             await pilot.pause()
             self.assertEqual(app.query_one('#answer', TextArea).text, 'С оговоркой\n\nЧерновик Q1')
-            self.assertFalse(self.store.state['submitted'])
+            self.assertEqual(self.store.state['submitted_rounds'], [])
+
+    async def test_next_round_joins_the_list_with_global_numbers(self):
+        test_grill_ui.answer_all(self.store)
+        self.store.submit()
+        app = GrillApp(self.fixture.root, self.api)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause()
+            self.assertIsNone(app.qid)  # Opened between rounds: the waiting screen.
+            self.assertEqual(app.rows, ['', 'Q1', 'Q2', 'Q3', None])
+            # The agent adds the next round to the live session; the tab follows by itself.
+            self.store.add_round(test_grill_ui.next_round())
+            await app.tick()
+            await pilot.pause()
+            self.assertEqual(app.q['id'], 'Q4')
+            self.assertIs(app.focused, app.query_one('#answer'))
+            listing = app.query_one('#question-list', OptionList)
+            self.assertEqual(app.rows, ['', 'Q1', 'Q2', 'Q3', '', 'Q4', 'Q5'])
+            self.assertEqual(listing.highlighted, 5)
+            self.assertIn('Раунд 1 · отправлен', plain(listing.get_option_at_index(0).prompt))
+            self.assertIn('Раунд 2 · текущий', plain(listing.get_option_at_index(4).prompt))
+            self.assertTrue(listing.get_option_at_index(4).disabled)
+            self.assertIn('✓ 2. Что сохранять', plain(listing.get_option_at_index(2).prompt))
+            self.assertIn('○ 4. Вопрос Q4', plain(listing.get_option_at_index(5).prompt))
+            meta = str(app.query_one('#question-meta').render())
+            self.assertIn('Вопрос 4', meta)
+            self.assertIn('Раунд 2', meta)
+            # Enter stays within the open round: Q5 next, never a sent question.
+            await pilot.press('Д', 'а', 'enter')
+            await pilot.pause()
+            self.assertEqual(app.q['id'], 'Q5')
+            # Arrows skip round headers.
+            listing.focus()
+            listing.highlighted = 5
+            await pilot.press('up')
+            self.assertEqual(listing.highlighted, 3)
+
+    async def test_sent_question_is_history_but_its_chat_goes_on(self):
+        test_grill_ui.answer_all(self.store)
+        self.store.answer('Q1', {'selected': ['local'], 'text': 'Локально', 'confirmed': True})
+        self.store.submit()
+        self.store.add_round(test_grill_ui.next_round())
+        self.store.state['branches']['Q1']['summary'] = 'Черновик Q1'
+        app = GrillApp(self.fixture.root, self.api)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause()
+            self.assertEqual(app.q['id'], 'Q4')
+            listing = app.query_one('#question-list', OptionList)
+            listing.focus()
+            listing.highlighted = 1
+            await pilot.press('enter')
+            await pilot.pause()
+            self.assertEqual(app.q['id'], 'Q1')
+            self.assertIn('Раунд 1 · отправлен', str(app.query_one('#question-meta').render()))
+            choices, answer = app.query_one('#choices', ChoiceList), app.query_one('#answer', TextArea)
+            self.assertEqual((choices.selected, answer.text), (['local'], 'Локально'))
+            self.assertTrue(choices.disabled and answer.read_only)
+            self.assertFalse(app.query_one('#confirm').display)
+            self.assertTrue(app.query_one('#reopen').display)
+            self.assertTrue(app.query_one('#draft').display)
+            self.assertFalse(app.query_one('#draft-buttons').display)  # Nothing goes into a sent answer.
+            await pilot.press('f4', 'X', 'enter')
+            await pilot.pause()
+            self.assertEqual((app.q['id'], self.store.state['answers']['Q1']['text']), ('Q1', 'Локально'))
+            await pilot.press('f6', 'Е', 'щ', 'ё', 'enter')
+            await pilot.pause()
+            self.assertEqual(self.store.state['branches']['Q1']['messages'][0], {'role': 'user', 'text': 'Ещё'})
+            self.assertFalse(app.query_one('#summarize').disabled)
+
+    async def test_reopen_request_goes_with_the_round_or_alone(self):
+        test_grill_ui.answer_all(self.store)
+        self.store.submit()
+        self.store.add_round(test_grill_ui.next_round())
+        app = GrillApp(self.fixture.root, self.api)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause()
+            app.show_question('Q2')
+            await pilot.pause()
+            await pilot.click('#reopen')
+            await pilot.pause()
+            await pilot.pause()  # Focus moves after the form is laid out.
+            self.assertIs(app.focused, app.query_one('#reopen-reason'))
+            await pilot.press('enter')  # A request needs a reason.
+            await pilot.pause()
+            self.assertEqual(self.store.state['reopen'], {})
+            await pilot.press('Н', 'у', 'ж', 'н', 'ы', ' ', 'т', 'е', 'г', 'и', 'enter')
+            await pilot.pause()
+            self.assertEqual(self.store.state['reopen'], {'Q2': 'Нужны теги'})
+            self.assertIn('Нужны теги', str(app.query_one('#reopen-note').render()))
+            self.assertIn('пересмотр 1', str(app.query_one('#progress').render()))
+            listing = app.query_one('#question-list', OptionList)
+            self.assertTrue(plain(listing.get_option_at_index(2).prompt).startswith('↺ 2.'))
+            # Cancellable until it is sent.
+            await pilot.click('#reopen-cancel')
+            await pilot.pause()
+            self.assertEqual(self.store.state['reopen'], {})
+            # Asking again starts from the withdrawn reason.
+            await pilot.click('#reopen')
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.press('end', '!', 'enter')
+            await pilot.pause()
+            test_grill_ui.answer_all(self.store)
+            await app.tick()
+            await pilot.click('#submit')
+            await pilot.pause()
+            result = g.read(g.read(self.fixture.root/'status.json')['result_file'])
+            self.assertEqual((result['round_id'], [a['question_id'] for a in result['answers']]), ('r2', ['Q4', 'Q5']))
+            self.assertEqual(result['reopen'], [{'question_id': 'Q2', 'number': 2, 'round_id': 'demo-r1', 'reason': 'Нужны теги!'}])
+            # With no open round the same button sends the requests alone.
+            submit = app.query_one('#submit', Button)
+            self.assertTrue(submit.disabled)
+            app.show_question('Q4')
+            await pilot.pause()
+            await pilot.click('#reopen')
+            await pilot.pause()
+            await pilot.press('Ф', 'а', 'к', 'т', 'enter')
+            await pilot.pause()
+            self.assertEqual((str(submit.label), submit.disabled), ('Отправить пересмотр', False))
+            await pilot.click('#submit')
+            await pilot.pause()
+            alone = g.read(g.read(self.fixture.root/'status.json')['result_file'])
+            self.assertEqual((alone['round_id'], alone['answers'], alone['reopen'][0]['question_id']), (None, [], 'Q4'))
+            self.assertIsNone(app.qid)
 
 
 if __name__ == '__main__':
