@@ -89,6 +89,8 @@ print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':
     fake.chmod(0o700)
     env['PATH'] = str(bindir)+os.pathsep+env['PATH']
     round_dir = tmp/'round'
+    # A private data dir: open must build its own venv, and the owner's venv and registry stay untouched.
+    env['XDG_DATA_HOME'] = str(tmp/'data')
     subprocess.run([sys.executable,str(ROOT/'scripts/grill_ui.py'),'init','--session',str(round_dir),
         '--round',str(ROOT/'assets/example-round.json'),'--cwd',str(tmp),'--harness','codex','--model','smoke','--effort','high'],
         env=env,check=True,stdout=subprocess.DEVNULL)
@@ -96,6 +98,8 @@ print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':
         env=env,capture_output=True,text=True)
     if result.returncode:
         raise RuntimeError(result.stderr)
+    assert json.loads(result.stdout)['tab'], 'open stdout must stay JSON after installing'
+    assert (tmp/'data/grill-ui/venv/grill-requirements.sha256').is_file(), 'open did not install the venv'
     info = {'tmp':str(tmp),'session':session,'round':str(round_dir),'env':{k:v for k,v in env.items() if k.startswith(('HERDR_', 'XDG_')) or k in ('PATH','LANG','LC_ALL','SHELL')},
             'binary':binary,'root':str(ROOT)}
     # Keep environment private, only expose the path to the test controller.
@@ -148,6 +152,20 @@ def control(path, action):
         until(lambda: read().count(h.SUBMIT_NOTICE)>=2, 'notice typed and entered in agent pane')
         h.herdr(['pane','send-keys',owner['parent_pane'],'ctrl+c'],env)
         return {'notified':True}
+    if action == 'handoff':
+        # Live handoff recreates the socket and terminal IDs; panes and their processes survive.
+        sock = Path(info['env']['HERDR_SOCKET_PATH'])
+        before = sock.stat().st_ino
+        terminals = lambda: {p['pane_id']: p['terminal_id'] for p in
+                             h.herdr(['pane','list','--workspace',owner['workspace']],env)['panes']}
+        old = terminals()
+        subprocess.run([info['binary'],'--session',info['session'],'server','live-handoff'],env=env,
+                       capture_output=True,check=True,timeout=40)
+        new = terminals()
+        assert sock.stat().st_ino != before, 'handoff kept the socket'
+        assert new.keys() == old.keys(), (old, new)
+        assert control(path,'tui-running'), 'TUI did not survive handoff'
+        return {'terminals_changed': new != old}
     if action == 'finish':
         result=subprocess.run([sys.executable,str(ROOT/'scripts/grill_herdr.py'),'finish','--session',info['round']],
                               env=env,capture_output=True,text=True,check=True)
@@ -172,6 +190,7 @@ def control(path, action):
                 pass
         subprocess.run([info['binary'],'--session',info['session'],'server','stop'],env=env,
                        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        shutil.rmtree(Path(info['tmp'])/'data',ignore_errors=True)
         # Drop only this run's unique session directory from the Herdr config.
         sessions=Path(info['env']['HERDR_SOCKET_PATH']).parent
         if sessions.name==info['session'] and sessions.name.startswith('grill-test-'):
@@ -223,7 +242,8 @@ def main():
                  args.remote_root+'/scripts/smoke_grill.py',*arguments])]
         else:
             cmd=[sys.executable,str(Path(__file__)),*arguments]
-        out=subprocess.run(cmd,capture_output=True,text=True,timeout=50)
+        # Prepare includes the first venv install.
+        out=subprocess.run(cmd,capture_output=True,text=True,timeout=180)
         if out.returncode: raise RuntimeError(out.stderr or out.stdout)
         return json.loads(out.stdout)
     info=invoke('--prepare')
@@ -317,11 +337,14 @@ def main():
             result=ctl('exercise')
             assert len(result['answers'])==3
             assert 'Ответ тестового агента' not in str(result)
+            # Both the TUI's notice and finish must rebind after a handoff.
+            ctl('handoff')
             ctl('notify')
+            ctl('handoff')
             ctl('finish')
             print(json.dumps({'ok':True,'mode':'saved-machine' if args.remote else 'local',
                               'remote':args.remote,'session':info['session'],
-                              'checks':['render','unicode-multiline-paste','mouse-confirm','reconnect','reopen','two-turn-chat','compact-submit','agent-notice','owned-tab-cleanup']},ensure_ascii=False))
+                              'checks':['render','unicode-multiline-paste','mouse-confirm','reconnect','reopen','two-turn-chat','compact-submit','handoff','agent-notice','owned-tab-cleanup','auto-install']},ensure_ascii=False))
         finally:
             (DEBUG/'client-transcript.txt').write_bytes(transcript)
             for log in tmp.rglob('*.log'):

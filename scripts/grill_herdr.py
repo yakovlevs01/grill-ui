@@ -19,6 +19,8 @@ from grill_ui import read, write, require
 ROOT = Path(__file__).resolve().parent.parent
 DATA = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share'))) / 'grill-ui'
 PYTHON = DATA / 'venv/bin/python'
+# Digest of the requirements.txt this venv was built from; written only after a full install.
+STAMP = DATA / 'venv/grill-requirements.sha256'
 CONTEXT_KEYS = ('HERDR_SOCKET_PATH', 'HERDR_SESSION', 'HERDR_CONFIG_PATH',
                 'HERDR_BIN_PATH', 'HERDR_WORKSPACE_ID', 'HERDR_TAB_ID', 'HERDR_PANE_ID')
 SUBMIT_NOTICE = 'Готово: ответы Grill отправлены'
@@ -50,22 +52,65 @@ def context():
     pane = herdr(['pane', 'current', '--current'])['pane']
     endpoint = Path(os.environ['HERDR_SOCKET_PATH']).resolve()
     stat = endpoint.stat()
+    # Live handoff keeps pane processes, so the shell PID outlives terminal IDs.
+    shell = herdr(['pane', 'process-info', '--pane', pane['pane_id']])['process_info'].get('shell_pid')
     return {'host': socket.gethostname(), 'socket': str(endpoint),
             'socket_identity': [stat.st_dev, stat.st_ino],
             'env': {k: os.environ[k] for k in CONTEXT_KEYS if k in os.environ},
             'workspace': pane['workspace_id'], 'parent_tab': pane['tab_id'],
-            'parent_pane': pane['pane_id'], 'parent_terminal': pane['terminal_id']}
+            'parent_pane': pane['pane_id'], 'parent_terminal': pane['terminal_id'],
+            'parent_shell': shell}
 
 
-def owner_env(owner):
+def owner_env(owner, session=None):
     require(owner['host'] == socket.gethostname(), 'This round belongs to another host')
-    stat = Path(owner['socket']).stat()
-    require(owner['socket_identity'] == [stat.st_dev, stat.st_ino],
-            'Herdr server endpoint changed; refusing to reuse old tab IDs')
     env = {k: v for k, v in os.environ.items() if not k.startswith('HERDR_')}
     env.update(owner['env'])
     env.update(HERDR_ENV='1', HERDR_SOCKET_PATH=owner['socket'])
+    stat = Path(owner['socket']).stat()
+    if owner['socket_identity'] != [stat.st_dev, stat.st_ino]:
+        # A restart kills the TUI; a live handoff keeps it and changes only the socket and terminal IDs.
+        require(session and tui_alive(session), 'Herdr server endpoint changed; refusing to reuse old tab IDs')
+        rebind(session, owner, env, [stat.st_dev, stat.st_ino])
     return env
+
+
+def tui_alive(session):
+    # grill_tui.py holds this lock while it runs, even when the caller is that TUI.
+    with (Path(session) / 'tui.lock').open('a') as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
+
+
+def runs_tui(info, session):
+    return any(str(ROOT / 'scripts/grill_tui.py') in p.get('argv', []) and str(session) in p.get('argv', [])
+               for p in info.get('foreground_processes', []))
+
+
+def rebind(session, owner, env, identity):
+    """Adopt a live handoff: the recorded panes survive, their terminal IDs are new."""
+    session = Path(session).resolve()
+    changed = 'Herdr server endpoint changed and '
+    panes = herdr(['pane', 'list', '--workspace', owner['workspace']], env)['panes']
+    panes = [p for p in panes if p['tab_id'] == owner.get('tab')]
+    require(len(panes) == 1 and panes[0]['pane_id'] == owner['pane'],
+            changed + 'the Grill tab topology differs; refusing to reuse old tab IDs')
+    info = herdr(['pane', 'process-info', '--pane', owner['pane']], env)['process_info']
+    require(runs_tui(info, session), changed + 'the Grill tab does not run this round; refusing to reuse old tab IDs')
+    parent = herdr(['pane', 'get', owner['parent_pane']], env)['pane']
+    require(parent['workspace_id'] == owner['workspace'],
+            changed + 'the agent pane moved; refusing to reuse old tab IDs')
+    # Rounds opened before parent_shell was recorded rely on the pane ID alone.
+    if owner.get('parent_shell'):
+        info = herdr(['pane', 'process-info', '--pane', owner['parent_pane']], env)['process_info']
+        require(info.get('shell_pid') == owner['parent_shell'],
+                changed + 'the agent pane has a new shell; refusing to reuse old tab IDs')
+    owner.update(socket_identity=identity, terminal=panes[0]['terminal_id'],
+                 parent_terminal=parent['terminal_id'])
+    write(session / 'herdr.json', owner)
 
 
 @contextmanager
@@ -113,7 +158,7 @@ def owned_pane(owner, env):
 def open_tab(args):
     session = Path(args.session).resolve()
     require((session / 'state.json').is_file(), 'Initialize the round first')
-    require(PYTHON.exists(), 'Run grill_herdr.py install on this host first')
+    ensure_venv()
     # Fail before opening a tab if the environment is incomplete.
     subprocess.run([str(PYTHON), '-c', 'import textual'], check=True, capture_output=True)
     caller = context()
@@ -124,7 +169,7 @@ def open_tab(args):
                 and owner['workspace'] == caller['workspace'],
                 'Round belongs to a different Herdr server/workspace')
         require(not owner.get('finished'), 'This round is finished; create a new round')
-        env = owner_env(owner)
+        env = owner_env(owner, session)
         ensure_server(session)
         if owner.get('tab') and tab_present(owner, env):
             owned_pane(owner, env)
@@ -174,7 +219,7 @@ def finish(args):
         if owner.get('finished'):
             print(json.dumps({'finished': True, 'already_finished': True}))
             return
-        env = owner_env(owner)
+        env = owner_env(owner, session)
         if tab_present(owner, env):
             owned_pane(owner, env)
             info = herdr(['pane', 'process-info', '--pane', owner['pane']], env)['process_info']
@@ -197,8 +242,10 @@ def finish(args):
 
 
 def agent_pane(session):
-    owner = read(Path(session) / 'herdr.json')
-    env = owner_env(owner)
+    # The lifecycle lock serializes a handoff rebind with open and finish.
+    with locked(Path(session)):
+        owner = read(Path(session) / 'herdr.json')
+        env = owner_env(owner, session)
     pane = herdr(['pane', 'get', owner['parent_pane']], env)['pane']
     require(pane['terminal_id'] == owner['parent_terminal'], 'Original agent terminal is gone')
     return pane, env
@@ -234,16 +281,48 @@ def wait(args):
         time.sleep(.5)
 
 
-def install(args):
+def requirements_digest():
+    return hashlib.sha256((ROOT / 'requirements.txt').read_bytes()).hexdigest()
+
+
+def venv_current():
+    return PYTHON.exists() and STAMP.is_file() and STAMP.read_text().strip() == requirements_digest()
+
+
+def setup_venv(force=False):
+    """Create or update the TUI venv. Progress goes to stderr: stdout carries only JSON."""
     DATA.mkdir(parents=True, exist_ok=True)
-    if shutil.which('uv'):
-        if not PYTHON.exists():
-            subprocess.run(['uv', 'venv', '--python', '>=3.11', str(PYTHON.parent.parent)], check=True)
-        subprocess.run(['uv', 'pip', 'install', '--python', str(PYTHON), '-r', str(ROOT / 'requirements.txt')], check=True)
-    else:
-        if not PYTHON.exists():
-            subprocess.run([sys.executable, '-m', 'venv', str(PYTHON.parent.parent)], check=True)
-        subprocess.run([str(PYTHON), '-m', 'pip', 'install', '-r', str(ROOT / 'requirements.txt')], check=True)
+    with (DATA / 'install.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # A concurrent open may have finished the same install while we waited.
+        if not force and venv_current():
+            return
+        venv, requirements, digest = str(PYTHON.parent.parent), str(ROOT / 'requirements.txt'), requirements_digest()
+        if shutil.which('uv'):
+            steps = [] if PYTHON.exists() else [['uv', 'venv', '--python', '>=3.11', venv]]
+            steps.append(['uv', 'pip', 'install', '--python', str(PYTHON), '-r', requirements])
+        else:
+            require(sys.version_info >= (3, 11), 'The TUI venv needs uv or Python 3.11+')
+            steps = [] if PYTHON.exists() else [[sys.executable, '-m', 'venv', venv]]
+            steps.append([str(PYTHON), '-m', 'pip', 'install', '-r', requirements])
+        for step in steps:
+            subprocess.run(step, check=True, stdout=sys.stderr)
+        STAMP.write_text(digest + '\n')
+
+
+def ensure_venv():
+    if venv_current():
+        return
+    print(f'grill: installing the TUI environment into {PYTHON.parent.parent}', file=sys.stderr)
+    try:
+        setup_venv()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(f'TUI environment install failed ({exc}); it needs uv or python3 with venv/pip '
+                         'and network access. Retry with grill_herdr.py install') from exc
+
+
+def install(args):
+    setup_venv(force=True)
     print(json.dumps({'python': str(PYTHON)}))
 
 
