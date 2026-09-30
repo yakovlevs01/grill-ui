@@ -17,10 +17,11 @@ claude --version && claude auth status         # Claude Code
 
 | | Codex | Claude Code |
 |---|---|---|
-| Ход | `codex exec --json -m M -c model_reasoning_effort=E -` | `claude -p --output-format stream-json --verbose --model M --effort E` |
+| Ход | `codex exec --json -m M -c model_reasoning_effort=E -` | `claude -p --output-format stream-json --verbose --include-partial-messages --model M --effort E` |
 | Продолжение | `resume <thread_id>` | `--resume <session_id>` |
-| Только чтение | `sandbox_mode="read-only"`, `approval_policy="never"` | `--tools Read,Grep,Glob --strict-mcp-config --disable-slash-commands` |
-| События | `thread.started`, `item.completed`/`agent_message`, `turn.failed`, `error` | `system`/`init`, `result` (`is_error`) |
+| Только чтение | `sandbox_mode="read-only"`, `approval_policy="never"` | `--tools Read,Grep,Glob,WebSearch,WebFetch --strict-mcp-config --disable-slash-commands` |
+| Веб | `-c web_search="live"` (`--search` есть только у интерактивного `codex`) | `--allowedTools WebSearch,WebFetch`: без него `-p` отклоняет их запрос разрешения |
+| События | `thread.started`, `item.completed`/`agent_message`, `turn.failed`, `error` | `system`/`init`, `stream_event`/`content_block_delta`/`text_delta`, `result` (`is_error`) |
 | Каталог моделей | `codex debug models` | алиасы `opus`, `sonnet`, `haiku`; effort из `claude --help` |
 
 Дочерний CLI запускается без переменных родительской сессии (`CODEX_THREAD_ID`,
@@ -73,8 +74,8 @@ F4 переходит к ответу, F5 к выбору агента, F6 к с
 непустой ответ и переходит к следующему неподтверждённому вопросу; при пустом
 ответе ничего не делает. Когда подтверждены все, фокус встаёт на «Отправить все
 ответы». Enter в поле сообщения отправляет его агенту. Shift+Enter или Ctrl+J
-переносит строку. Пока агент отвечает, над полем сообщения видно время хода и
-его последнее действие.
+переносит строку. Пока агент отвечает, его ответ появляется в чате по мере
+написания, а над полем сообщения видно время хода и последнее действие.
 
 Выпадающие списки над чатом задают харнесс, модель и effort для новых чатов и
 применяются сразу. Списки берутся из установленных CLI при старте сервера:
@@ -195,14 +196,19 @@ Claude Code появляются в `claude --resume` для cwd проекта.
 
 App Server также поддерживает thread/start, turn/start и thread/resume.
 Для этого небольшого локального интерфейса выбран exec + resume, чтобы
-обойтись Python stdlib без отдельного JSON-RPC клиента. Ответ появляется
-после завершения хода; посимвольного стриминга нет. Пока идёт ход, TUI
-показывает время с его начала и последнее действие агента из событий CLI
-(команда, чтение файла, поиск).
+обойтись Python stdlib без отдельного JSON-RPC клиента. Пока идёт ход,
+сервер держит написанную часть ответа в `branch.partial`, TUI опрашивает его
+каждые 0,3 с и показывает время хода и последнее действие агента из событий
+CLI (команда, чтение файла, поиск). Claude Code отдаёт текст по фрагментам.
+`codex exec --json` фрагментов не отдаёт: каждое завершённое `agent_message`
+видно сразу, остальное в конце хода. `state.json` во время ответа пишется не
+чаще раза в 0,3 с. Итоговый ответ заменяет частичный; при ошибке или остановке
+в переписке остаётся то, что успело прийти.
 
 Каждый вызов получает явные model/effort и read-only режим (см. таблицу выше).
-Ветка предназначена для обсуждения. У Codex read-only ограничивает файловые
-команды, но не является универсальной изоляцией подключённых MCP-инструментов;
+Ветка предназначена для обсуждения. Чат может искать в интернете; страницы и
+результаты поиска для него данные, не инструкции. У Codex read-only ограничивает
+файловые команды, но не является универсальной изоляцией подключённых MCP-инструментов;
 Claude Code запускается без MCP и skills. Hooks пользователя работают в обоих.
 Не настраивай в этом приложении автоматическое разрешение мутаций.
 Глобальные конфигурация, провайдер, hooks и MCP CLI могут отличаться от
@@ -227,7 +233,12 @@ Claude Code запускается без MCP и skills. Hooks пользова�
 возобновление по ID, model/effort и read-only конфигурация. Каталог
 `codex debug models` проверен на 0.156.1. Claude Code 2.1.281: stream-json,
 `session_id` в `system/init`, resume по ID с сохранением контекста, ошибка
-неизвестной модели как `result` с `is_error`.
+неизвестной модели как `result` с `is_error`. Claude Code 2.1.285:
+`--include-partial-messages` (`stream_event` с `content_block_start`/`text` и
+`content_block_delta`/`text_delta`), WebSearch и WebFetch в `-p` с
+`--allowedTools`. Codex CLI 0.159.2: `-c web_search="live"` в `exec` и
+`exec resume` (значения `disabled`, `cached`, `indexed`, `live`),
+промежуточные `agent_message` до конца хода, текстовых дельт нет.
 
 - [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode)
 - [Codex App Server](https://learn.chatgpt.com/docs/app-server)
