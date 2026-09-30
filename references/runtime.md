@@ -17,10 +17,11 @@ claude --version && claude auth status         # Claude Code
 
 | | Codex | Claude Code |
 |---|---|---|
-| Ход | `codex exec --json -m M -c model_reasoning_effort=E -` | `claude -p --output-format stream-json --verbose --model M --effort E` |
+| Ход | `codex exec --json -m M -c model_reasoning_effort=E -` | `claude -p --output-format stream-json --verbose --include-partial-messages --model M --effort E` |
 | Продолжение | `resume <thread_id>` | `--resume <session_id>` |
-| Только чтение | `sandbox_mode="read-only"`, `approval_policy="never"` | `--tools Read,Grep,Glob --strict-mcp-config --disable-slash-commands` |
-| События | `thread.started`, `item.completed`/`agent_message`, `turn.failed`, `error` | `system`/`init`, `result` (`is_error`) |
+| Только чтение | `sandbox_mode="read-only"`, `approval_policy="never"` | `--tools Read,Grep,Glob,WebSearch,WebFetch --strict-mcp-config --disable-slash-commands` |
+| Веб | `-c web_search="live"` (`--search` есть только у интерактивного `codex`) | `--allowedTools WebSearch,WebFetch`: без него `-p` отклоняет их запрос разрешения |
+| События | `thread.started`, `item.completed`/`agent_message`, `turn.failed`, `error` | `system`/`init`, `stream_event`/`content_block_delta`/`text_delta`, `result` (`is_error`) |
 | Каталог моделей | `codex debug models` | алиасы `opus`, `sonnet`, `haiku`; effort из `claude --help` |
 
 Дочерний CLI запускается без переменных родительской сессии (`CODEX_THREAD_ID`,
@@ -34,17 +35,20 @@ claude --version && claude auth status         # Claude Code
 на Linux или Mac, TUI и агентские CLI работают на хосте выбранного workspace.
 Идентификаторы привязаны к серверному socket, а не только к `w1:t2`.
 
-Один раз на каждом хосте, где запускаются агенты:
+TUI работает в отдельном окружении `${XDG_DATA_HOME:-~/.local/share}/grill-ui/venv`
+с закреплённым Textual. `open` и действие плагина создают его сами, если его
+нет или `requirements.txt` изменился после установки: в venv хранится
+sha256 файла, с которым он собран. Установщик использует uv, если он есть,
+иначе venv/pip текущего Python 3.11+, и нуждается в сети. Ход установки идёт
+в stderr, stdout `open` остаётся JSON. На Mac системный Python может быть
+старее; тогда нужен uv. Установить заранее или повторить после ошибки:
 
 ```sh
 python3 "$SKILL_DIR/scripts/grill_herdr.py" install
 herdr plugin link "$SKILL_DIR"
 ```
 
-`install` создаёт отдельное окружение в `${XDG_DATA_HOME:-~/.local/share}/grill-ui/venv`
-с закреплённым Textual. Использует uv, если он есть, иначе venv/pip текущего
-Python 3.11+. На Mac системный Python может быть старее; запускай установщик
-через `uv run --python 3.13 python`. Плагин необязателен для запуска из скилла.
+Плагин необязателен для запуска из скилла.
 Его действие `local.grill-ui.reopen` открывает последний раунд текущего workspace.
 Если раундов несколько, используй `open --session` с точным путём.
 
@@ -70,8 +74,8 @@ F4 переходит к ответу, F5 к выбору агента, F6 к с
 непустой ответ и переходит к следующему неподтверждённому вопросу; при пустом
 ответе ничего не делает. Когда подтверждены все, фокус встаёт на «Отправить все
 ответы». Enter в поле сообщения отправляет его агенту. Shift+Enter или Ctrl+J
-переносит строку. Пока агент отвечает, над полем сообщения видно время хода и
-его последнее действие.
+переносит строку. Пока агент отвечает, его ответ появляется в чате по мере
+написания, а над полем сообщения видно время хода и последнее действие.
 
 Выпадающие списки над чатом задают харнесс, модель и effort для новых чатов и
 применяются сразу. Списки берутся из установленных CLI при старте сервера:
@@ -93,7 +97,9 @@ F4 переходит к ответу, F5 к выбору агента, F6 к с
 который прочитает агент.
 Текст добавляется к набранному в поле ввода, а не заменяет его. Перед вводом
 проверяется, что это тот же терминал, из которого открыт раунд; иначе TUI
-ничего не вводит и просит владельца вернуться вручную. Уведомление отправляется
+ничего не вводит и просит владельца вернуться вручную. Live handoff Herdr
+(`herdr server live-handoff`) пересоздаёт socket и terminal ID, но сохраняет
+ID панелей и их процессы; это обрабатывается как описано у `finish`. Уведомление отправляется
 один раз, при нажатии кнопки; повторное открытие TUI его не повторяет.
 
 `wait` не показывает ответы до отправки и не запускает новый ход родительского
@@ -105,8 +111,12 @@ python3 "$SKILL_DIR/scripts/grill_herdr.py" finish --session "$ROUND_DIR/session
 ```
 
 `finish` проверяет host, socket и его identity, workspace, tab, pane и terminal.
-Если сервер перезапущен или во вкладку добавлены чужие панели, команда отказывает
-в автоматическом закрытии. Она не завершает сервер Herdr. Данные раунда остаются.
+Если сменилась identity socket, а TUI этого раунда ещё держит `tui.lock`, это
+live handoff: перезапуск сервера убил бы TUI. Тогда `open`, `finish` и ввод
+«Готово» перечитывают terminal ID и обновляют `herdr.json`, если tab раунда
+остался с одной панелью в том же workspace, в ней работает этот TUI, а панель
+агента существует с тем же shell PID. Если сервер перезапущен, TUI закрыт или
+во вкладку добавлены чужие панели, команда отказывает в автоматическом закрытии. Она не завершает сервер Herdr. Данные раунда остаются.
 Отключение клиента не закрывает tab и не отменяет обсуждение.
 
 В новом раунде создай новый session-каталог и новый tab.
@@ -137,7 +147,7 @@ python3 "$SKILL_DIR/scripts/grill_ui.py" init \
 
 В Herdr после `init` достаточно `grill_herdr.py open`: он сам запускает сервер
 и TUI. Вне Herdr запусти сервер сам и дай владельцу команду для его терминала
-на той же машине:
+на той же машине. Если venv ещё нет, сначала выполни `grill_herdr.py install`.
 
 ```sh
 python3 "$SKILL_DIR/scripts/grill_ui.py" serve --session "$ROUND_DIR/session"
@@ -186,14 +196,19 @@ Claude Code появляются в `claude --resume` для cwd проекта.
 
 App Server также поддерживает thread/start, turn/start и thread/resume.
 Для этого небольшого локального интерфейса выбран exec + resume, чтобы
-обойтись Python stdlib без отдельного JSON-RPC клиента. Ответ появляется
-после завершения хода; посимвольного стриминга нет. Пока идёт ход, TUI
-показывает время с его начала и последнее действие агента из событий CLI
-(команда, чтение файла, поиск).
+обойтись Python stdlib без отдельного JSON-RPC клиента. Пока идёт ход,
+сервер держит написанную часть ответа в `branch.partial`, TUI опрашивает его
+каждые 0,3 с и показывает время хода и последнее действие агента из событий
+CLI (команда, чтение файла, поиск). Claude Code отдаёт текст по фрагментам.
+`codex exec --json` фрагментов не отдаёт: каждое завершённое `agent_message`
+видно сразу, остальное в конце хода. `state.json` во время ответа пишется не
+чаще раза в 0,3 с. Итоговый ответ заменяет частичный; при ошибке или остановке
+в переписке остаётся то, что успело прийти.
 
 Каждый вызов получает явные model/effort и read-only режим (см. таблицу выше).
-Ветка предназначена для обсуждения. У Codex read-only ограничивает файловые
-команды, но не является универсальной изоляцией подключённых MCP-инструментов;
+Ветка предназначена для обсуждения. Чат может искать в интернете; страницы и
+результаты поиска для него данные, не инструкции. У Codex read-only ограничивает
+файловые команды, но не является универсальной изоляцией подключённых MCP-инструментов;
 Claude Code запускается без MCP и skills. Hooks пользователя работают в обоих.
 Не настраивай в этом приложении автоматическое разрешение мутаций.
 Глобальные конфигурация, провайдер, hooks и MCP CLI могут отличаться от
@@ -218,7 +233,12 @@ Claude Code запускается без MCP и skills. Hooks пользова�
 возобновление по ID, model/effort и read-only конфигурация. Каталог
 `codex debug models` проверен на 0.156.1. Claude Code 2.1.281: stream-json,
 `session_id` в `system/init`, resume по ID с сохранением контекста, ошибка
-неизвестной модели как `result` с `is_error`.
+неизвестной модели как `result` с `is_error`. Claude Code 2.1.285:
+`--include-partial-messages` (`stream_event` с `content_block_start`/`text` и
+`content_block_delta`/`text_delta`), WebSearch и WebFetch в `-p` с
+`--allowedTools`. Codex CLI 0.159.2: `-c web_search="live"` в `exec` и
+`exec resume` (значения `disabled`, `cached`, `indexed`, `live`),
+промежуточные `agent_message` до конца хода, текстовых дельт нет.
 
 - [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode)
 - [Codex App Server](https://learn.chatgpt.com/docs/app-server)
@@ -242,8 +262,10 @@ uv pip install --python "$TUI_PYTHON" -r "$SKILL_DIR/requirements-test.txt"
 --remote-python PYTHON_PATH` проверяет реальное подключение через временный
 профиль `herdr machine add`. На обеих сторонах нужен checkout скилла и тестовые
 зависимости. Проверки включают Unicode paste, клик мышью, переподключение,
-повторное открытие, продолжение чата по тому же ID и ввод «Готово» с Enter
-в панель агента. Локальный клиент smoke получает отдельный `XDG_STATE_HOME`:
+повторное открытие, продолжение чата по тому же ID, live handoff сервера
+Herdr перед вводом «Готово» с Enter в панель агента и перед `finish`, установку
+venv при первом `open`. Smoke использует временный `XDG_DATA_HOME`, поэтому
+ставит свой venv и не трогает рабочий. Локальный клиент smoke получает отдельный `XDG_STATE_HOME`:
 иначе он видит сохранённые машины владельца и переключается вслед за его
 выбором. Cleanup удаляет каталог своей тестовой сессии, а копии экрана и логов
 последнего прогона остаются в `$TMPDIR/grill-smoke-debug` с правами 0700.

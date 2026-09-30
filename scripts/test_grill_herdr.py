@@ -1,4 +1,7 @@
 """Guard against cross-host/session and modified-tab cleanup."""
+import contextlib
+import fcntl
+import io
 import json
 import tempfile
 import unittest
@@ -97,6 +100,146 @@ class OwnershipTests(unittest.TestCase):
             herdr.assert_not_called()
         finally:
             f.tearDown()
+
+
+class HandoffTests(unittest.TestCase):
+    """A live handoff keeps panes and processes; a restart kills the TUI."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.session = Path(self.tmp.name).resolve()
+        sock = self.session/'herdr.sock'
+        sock.touch()
+        stat = sock.stat()
+        self.identity = [stat.st_dev, stat.st_ino]
+        self.owner = {'host': h.socket.gethostname(), 'socket': str(sock),
+                      'socket_identity': [stat.st_dev, stat.st_ino+1], 'env': {},
+                      'workspace': 'w1', 'tab': 'w1:t2', 'pane': 'w1:p2', 'terminal': 'term-old',
+                      'parent_pane': 'w1:p1', 'parent_terminal': 'agent-old', 'parent_shell': 40}
+        h.write(self.session/'herdr.json', self.owner)
+        # A notice follows a submit, which always leaves the newest result in status.json.
+        h.write(self.session/'status.json', {'submitted': True, 'result_file': str(self.session/'submissions/0001.json')})
+        tui =['python', str(h.ROOT/'scripts/grill_tui.py'), '--session', str(self.session)]
+        self.processes = {'w1:p2': {'shell_pid': 50, 'foreground_processes': [{'pid': 51, 'argv': tui}]},
+                          'w1:p1': {'shell_pid': 40}}
+        self.calls = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fake(self, args, env=None):
+        self.calls.append(args)
+        if args[:2] == ['pane', 'list']:
+            return {'panes': [{'tab_id': 'w1:t1', 'pane_id': 'w1:p1', 'terminal_id': 'agent-new'},
+                              {'tab_id': 'w1:t2', 'pane_id': 'w1:p2', 'terminal_id': 'term-new'}]}
+        if args[:2] == ['pane', 'process-info']:
+            return {'process_info': self.processes[args[3]]}
+        if args[:2] == ['pane', 'get']:
+            return {'pane': {'pane_id': 'w1:p1', 'tab_id': 'w1:t1', 'workspace_id': 'w1', 'terminal_id': 'agent-new'}}
+        return {}
+
+    @contextlib.contextmanager
+    def tui_running(self):
+        # A second open file description conflicts with the TUI's flock, as in the real process.
+        with (self.session/'tui.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
+    def test_handoff_with_live_tui_rebinds_terminals(self):
+        with self.tui_running(), patch.object(h, 'herdr', self.fake):
+            h.owner_env(self.owner, self.session)
+            saved = h.read(self.session/'herdr.json')
+            self.assertEqual(saved['socket_identity'], self.identity)
+            self.assertEqual((saved['terminal'], saved['parent_terminal']), ('term-new', 'agent-new'))
+            self.calls.clear()
+            h.owner_env(saved, self.session)
+            self.assertEqual(self.calls, [])
+
+    def test_notice_reaches_agent_after_handoff(self):
+        with self.tui_running(), patch.object(h, 'herdr', self.fake), patch.object(h.time, 'sleep'):
+            h.notify_agent(self.session)
+        self.assertEqual(self.calls[-1], ['pane', 'send-keys', 'w1:p1', 'enter'])
+
+    def test_restart_without_live_tui_is_refused(self):
+        with patch.object(h, 'herdr', self.fake):
+            with self.assertRaisesRegex(ValueError, 'endpoint changed; refusing'):
+                h.owner_env(self.owner, self.session)
+            with self.assertRaisesRegex(ValueError, 'endpoint changed; refusing'):
+                h.owner_env(self.owner)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(h.read(self.session/'herdr.json')['terminal'], 'term-old')
+
+    def test_restored_panes_with_new_processes_are_refused(self):
+        restored = [('w1:p1', {'shell_pid': 41}, 'new shell'),
+                    ('w1:p2', {'shell_pid': 52}, 'does not run this round')]
+        for pane, info, reason in restored:
+            with self.subTest(reason=reason), self.tui_running(), patch.object(h, 'herdr', self.fake), \
+                 patch.dict(self.processes, {pane: info}):
+                with self.assertRaisesRegex(ValueError, reason):
+                    h.owner_env(dict(self.owner), self.session)
+        self.assertEqual(h.read(self.session/'herdr.json')['terminal'], 'term-old')
+
+
+class VenvTests(unittest.TestCase):
+    """The TUI venv is rebuilt when missing or built from other requirements."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        data = Path(self.tmp.name)/'grill-ui'
+        self.python = data/'venv/bin/python'
+        self.patches = [patch.object(h, 'DATA', data), patch.object(h, 'PYTHON', self.python),
+                        patch.object(h, 'STAMP', data/'venv/grill-requirements.sha256'),
+                        patch.object(h.shutil, 'which', return_value='/usr/bin/uv')]
+        for item in self.patches:
+            item.start()
+        self.steps = []
+
+    def tearDown(self):
+        for item in self.patches:
+            item.stop()
+        self.tmp.cleanup()
+
+    def run_step(self, args, **kwargs):
+        # Installer output must not mix with the JSON that open prints.
+        self.assertIs(kwargs['stdout'], h.sys.stderr)
+        self.steps.append(args[:3])
+        if args[:2] == ['uv', 'venv']:
+            self.python.parent.mkdir(parents=True)
+            self.python.touch()
+
+    def test_install_on_missing_or_changed_requirements_only(self):
+        with patch.object(h.subprocess, 'run', self.run_step), quiet():
+            h.ensure_venv()
+            self.assertEqual(self.steps, [['uv', 'venv', '--python'], ['uv', 'pip', 'install']])
+            self.assertEqual(h.STAMP.read_text().strip(), h.requirements_digest())
+            self.steps.clear()
+            h.ensure_venv()
+            self.assertEqual(self.steps, [])
+            with patch.object(h, 'requirements_digest', return_value='other'):
+                h.ensure_venv()
+            self.assertEqual(self.steps, [['uv', 'pip', 'install']])
+
+    def test_failed_install_leaves_no_stamp(self):
+        def fail(args, **kwargs):
+            self.run_step(args, **kwargs)
+            if args[1] == 'pip':
+                raise h.subprocess.CalledProcessError(1, args)
+        with patch.object(h.subprocess, 'run', fail), quiet():
+            with self.assertRaisesRegex(ValueError, 'install failed.*grill_herdr.py install'):
+                h.ensure_venv()
+        self.assertFalse(h.STAMP.exists())
+
+    def test_explicit_install_keeps_stdout_json(self):
+        self.python.parent.mkdir(parents=True)
+        self.python.touch()
+        h.STAMP.write_text(h.requirements_digest())
+        out = io.StringIO()
+        with patch.object(h.subprocess, 'run', self.run_step), contextlib.redirect_stdout(out):
+            h.install(None)
+        self.assertEqual(self.steps, [['uv', 'pip', 'install']])
+        self.assertEqual(json.loads(out.getvalue()), {'python': str(self.python)})
+
+
+def quiet():
+    return contextlib.redirect_stderr(io.StringIO())
 
 
 if __name__ == '__main__':

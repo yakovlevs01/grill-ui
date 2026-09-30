@@ -12,10 +12,15 @@
 
 ```sh
 npx skills@latest add yakovlevs01/grill-ui --skill grill-ui -g
+```
+
+Откройте новую сессию агента после установки. Зависимости интерфейса ставятся в отдельное Python-окружение `~/.local/share/grill-ui/venv` при первом открытии раунда. Для этого нужны uv или python3 с модулями venv и pip, а также доступ к сети. Поставить их заранее можно командой:
+
+```sh
 python3 "$HOME/.agents/skills/grill-ui/scripts/grill_herdr.py" install
 ```
 
-Вторая команда устанавливает зависимости интерфейса в отдельное Python-окружение. Если установщик Skills показал другой каталог скилла, подставьте его путь. Откройте новую сессию агента после установки.
+Если установщик Skills показал другой каталог скилла, подставьте его путь.
 
 ## Использование
 
@@ -33,10 +38,9 @@ python3 "$HOME/.agents/skills/grill-ui/scripts/grill_herdr.py" install
 
 ```sh
 npx skills@latest update
-python3 "$HOME/.agents/skills/grill-ui/scripts/grill_herdr.py" install
 ```
 
-Skills получает изменения из GitHub; вторая команда обновляет зависимости интерфейса. Синхронизация между ПК не автоматическая. Версии отмечаются git-тегами.
+Skills получает изменения из GitHub. Если изменились зависимости интерфейса, следующее открытие раунда обновит окружение само. Синхронизация между ПК не автоматическая. Версии отмечаются git-тегами.
 
 Инструкции для агента: [SKILL.md](SKILL.md). Запуск вручную, клавиши и устранение ошибок: [runtime](references/runtime.md). Пример входных данных: [example-round.json](assets/example-round.json).
 

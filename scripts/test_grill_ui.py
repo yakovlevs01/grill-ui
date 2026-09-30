@@ -342,7 +342,32 @@ print(json.dumps({'models': [
             {'type': 'text', 'text': 'Сейчас посмотрю'},
             {'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/repo/scripts/grill_tui.py'}}]}}
         self.assertEqual(claude.activity(read), 'читает grill_tui.py')
+        search = {'type': 'assistant', 'message': {'content': [
+            {'type': 'tool_use', 'name': 'WebSearch', 'input': {'query': 'python release'}}]}}
+        self.assertEqual(claude.activity(search), 'ищет в интернете «python release»')
+        writing = {'type': 'stream_event', 'event': {'type': 'content_block_start', 'index': 1,
+                                                      'content_block': {'type': 'text', 'text': ''}}}
+        self.assertEqual(claude.activity(writing), 'пишет ответ')
         self.assertIsNone(claude.activity({'type': 'result'}))
+
+    def test_partial_text_from_cli_events(self):
+        codex, claude = harness.HARNESSES['codex'], harness.HARNESSES['claude']
+        message = {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'второе'}}
+        self.assertEqual(codex.partial(message, ''), 'второе')
+        self.assertEqual(codex.partial(message, 'первое'), 'первое\n\nвторое')
+        self.assertIsNone(codex.partial({'type': 'item.started', 'item': {'type': 'web_search'}}, 'x'))
+        # Shapes as Claude Code 2.1.285 prints them with --include-partial-messages.
+        def stream(inner, parent=None):
+            return {'type': 'stream_event', 'event': inner, 'session_id': 's', 'parent_tool_use_id': parent}
+        delta = stream({'type': 'content_block_delta', 'index': 1, 'delta': {'type': 'text_delta', 'text': ' мир'}})
+        block = stream({'type': 'content_block_start', 'index': 1, 'content_block': {'type': 'text', 'text': ''}})
+        self.assertEqual(claude.partial(delta, 'Привет'), 'Привет мир')
+        self.assertIsNone(claude.partial(block, ''))
+        self.assertEqual(claude.partial(block, 'Сначала'), 'Сначала\n\n')
+        for other in (stream({'type': 'content_block_delta', 'delta': {'type': 'thinking_delta', 'thinking': 'x'}}),
+                      stream({'type': 'content_block_delta', 'delta': {'type': 'text_delta', 'text': 'x'}}, 'toolu_1'),
+                      {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'x'}]}}):
+            self.assertIsNone(claude.partial(other, 'y'))
 
     def test_transport_multiturn_and_failure(self):
         # A fake CLI checks real argv/stdin and persisted branch identity.
@@ -385,6 +410,7 @@ print(json.dumps({'type':'turn.completed'}))
                 self.assertIn('test-model', call['args'])
                 self.assertIn('model_reasoning_effort="high"', call['args'])
                 self.assertIn('sandbox_mode="read-only"', call['args'])
+                self.assertIn('web_search="live"', call['args'])
             self.store.start('Q1', 'FAIL-TEST')
             wait_done()
             self.assertEqual(self.store.state['branches']['Q1']['status'], 'error')
@@ -425,11 +451,82 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
             for call in calls:
                 self.assertFalse(call['nested'])
                 self.assertIn('Discuss' if call is calls[0] else 'Follow up', call['prompt'])
-                for flag in ('opus', 'high', 'Read,Grep,Glob', '--strict-mcp-config', '--disable-slash-commands'):
+                for flag in ('opus', 'high', '--include-partial-messages', 'Read,Grep,Glob,WebSearch,WebFetch',
+                             '--strict-mcp-config', '--disable-slash-commands'):
                     self.assertIn(flag, call['args'])
             self.store.start('Q1', 'FAIL-TEST')
             wait_done()
             self.assertEqual((branch['status'], branch['error']), ('error', 'model unavailable'))
+
+    def test_reply_streams_while_the_turn_runs(self):
+        # The fake prints part of a reply, then waits for the test to let it finish.
+        fake_cli(self.root, 'claude', '''import json,sys,time
+from pathlib import Path
+prompt=sys.stdin.read()
+def say(event): print(json.dumps(event),flush=True)
+say({'type':'system','subtype':'init','session_id':'streamed'})
+say({'type':'stream_event','event':{'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}}})
+for piece in 'Первая часть':
+    say({'type':'stream_event','event':{'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':piece}}})
+while not Path('go').exists(): time.sleep(.02)
+if 'STOP-TEST' in prompt: time.sleep(30)
+say({'type':'result','subtype':'success','is_error':False,'session_id':'streamed','result':'Первая часть и конец'})
+''')
+        fake_cli(self.root, 'codex', '''import json,sys,time
+from pathlib import Path
+sys.stdin.read()
+def say(event): print(json.dumps(event),flush=True)
+say({'type':'thread.started','thread_id':'codex-streamed'})
+say({'type':'item.completed','item':{'type':'agent_message','text':'Сначала поищу'}})
+while not Path('go').exists(): time.sleep(.02)
+say({'type':'item.completed','item':{'type':'agent_message','text':'Ответ'}})
+''')
+        branch = self.store.state['branches']['Q1']
+        def wait(check):
+            deadline = time.monotonic() + 5
+            while not check() and time.monotonic() < deadline:
+                time.sleep(.02)
+            with self.store.lock:
+                self.assertTrue(check())
+        writes = []
+        def counted(path, data):
+            writes.append(Path(path).name)
+            real_write(path, data)
+        def turn(message, streamed, stop=False):
+            (self.root / 'go').unlink(missing_ok=True)
+            writes.clear()
+            self.store.start('Q1', message)
+            wait(lambda: branch['partial'] == streamed)
+            self.assertEqual(branch['status'], 'running')
+            # The file catches up between deltas without a write per delta.
+            wait(lambda: g.read(self.root / 'state.json')['branches']['Q1']['partial'] == streamed)
+            self.assertLessEqual(writes.count('state.json'), 4)
+            (self.root / 'go').touch()
+            if stop:
+                self.store.stop('Q1')
+            wait(lambda: branch['status'] != 'running')
+        real_write = g.write
+        with patch.dict(os.environ, {'PATH': str(self.root) + os.pathsep + os.environ['PATH']}), \
+                patch.object(g, 'write', counted):
+            self.store.set_runtime({'harness': 'claude', 'model': 'opus', 'effort': 'high'})
+            turn('Discuss', 'Первая часть')
+            self.assertEqual((branch['messages'][-1]['text'], branch['partial'], branch['status']),
+                             ('Первая часть и конец', '', 'idle'))
+            # A stopped turn keeps what it streamed.
+            turn('STOP-TEST', 'Первая часть', stop=True)
+            self.assertEqual((branch['messages'][-1]['text'], branch['partial'], branch['status']),
+                             ('Первая часть', '', 'error'))
+            self.store.set_runtime({'harness': 'codex', 'model': 'test-model', 'effort': 'high'}, 'Q1', restart=True)
+            turn('Discuss', 'Сначала поищу')
+            self.assertEqual(branch['messages'][-1]['text'], 'Сначала поищу\n\nОтвет')
+
+    def test_restart_keeps_streamed_text(self):
+        self.store.state['branches']['Q1'].update(status='running', partial='Недописанный ответ',
+                                                  messages=[{'role': 'user', 'text': 'Вопрос'}])
+        self.store.save()
+        branch = g.Store(self.root).state['branches']['Q1']
+        self.assertEqual((branch['messages'][-1], branch['partial'], branch['status']),
+                         ({'role': 'assistant', 'text': 'Недописанный ответ'}, '', 'error'))
 
 
 if __name__ == '__main__':

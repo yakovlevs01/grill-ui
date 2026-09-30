@@ -2,6 +2,7 @@
 import copy
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -465,6 +466,55 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             alone = g.read(g.read(self.fixture.root/'status.json')['result_file'])
             self.assertEqual((alone['round_id'], alone['answers'], alone['reopen'][0]['question_id']), (None, [], 'Q4'))
             self.assertIsNone(app.qid)
+
+    async def test_streamed_reply_grows_and_follows_only_from_the_end(self):
+        branch = self.store.state['branches']['Q1']
+        history = [{'role': ('user', 'assistant')[i % 2], 'text': f'Сообщение {i}\n' * 3} for i in range(12)]
+        branch.update(thread_id='codex-thread', runtime=dict(self.store.state['runtime']), status='running',
+                      started_at=time.time(), activity='ищет в интернете', messages=history, partial='Начало')
+        app = GrillApp(self.fixture.root, self.api)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause()
+            scroll = app.query_one('#chat-scroll')
+            streamed = app.partial_message
+            self.assertIn('Начало', str(streamed.render()))
+            status = str(app.query_one('#chat-status').render())
+            self.assertIn('Codex отвечает', status)
+            self.assertIn('ищет в интернете', status)
+            self.assertTrue(scroll.is_vertical_scroll_end)
+            branch['partial'] = 'Начало и продолжение\n' * 5
+            await app.tick()
+            await pilot.pause()
+            self.assertIs(app.partial_message, streamed)  # Updated in place, the history is not redrawn.
+            self.assertIn('продолжение', str(streamed.render()))
+            self.assertTrue(scroll.is_vertical_scroll_end)
+            # The owner scrolled up to reread; the growing reply does not pull the view down.
+            scroll.scroll_home(animate=False)
+            await pilot.pause()
+            branch['partial'] += 'ещё\n' * 5
+            await app.tick()
+            await pilot.pause()
+            await pilot.pause()  # Scrolling waits for the refresh after the update.
+            self.assertEqual(scroll.scroll_y, 0)
+            # Back at the end, the view follows again.
+            scroll.scroll_end(animate=False)
+            await pilot.pause()
+            branch['partial'] += 'и ещё\n' * 5
+            await app.tick()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertTrue(scroll.is_vertical_scroll_end)
+            # The final reply replaces the streamed one.
+            branch['messages'].append({'role': 'assistant', 'text': 'Итог'})
+            branch.update(partial='', status='idle', activity='', started_at=None)
+            await app.tick()
+            await pilot.pause()
+            self.assertIsNone(app.partial_message)
+            texts = [str(m.render()) for m in scroll.query('.msg')]
+            self.assertEqual(len(texts), 13)
+            self.assertIn('Итог', texts[-1])
+            self.assertTrue(scroll.is_vertical_scroll_end)
+            self.assertEqual(str(app.query_one('#chat-status').render()), '')
 
 
 if __name__ == '__main__':

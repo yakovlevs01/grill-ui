@@ -196,11 +196,14 @@ class ChoiceList(OptionList):
         self.post_message(self.Toggled(self))
 
 
+def message_body(role, text, author):
+    color = PALETTE['accent'] if role == 'user' else PALETTE['strong']
+    return Text.assemble((author, f'bold {color}'), '\n', text)
+
+
 def chat_message(role, text, author):
     """One chat turn: author line, then the text, framed by role."""
-    color = PALETTE['accent'] if role == 'user' else PALETTE['strong']
-    body = Text.assemble((author, f'bold {color}'), '\n', text)
-    return Static(body, classes='msg ' + ('msg-user' if role == 'user' else 'msg-agent'))
+    return Static(message_body(role, text, author), classes='msg ' + ('msg-user' if role == 'user' else 'msg-agent'))
 
 
 class AgentPicker(Vertical):
@@ -470,6 +473,9 @@ class GrillApp(App):
         self.draft_dirty = set()
         self.api_lock = asyncio.Lock()
         self.chat_fingerprint = None
+        # The agent's reply while it is still being written, and its text on screen.
+        self.partial_message = None
+        self.partial_text = ''
         self.compact_view = 'center'
         self.expanded_chat = False
         # Wide-screen panels the owner hid with F2 / F7; they stay hidden across redraws.
@@ -597,10 +603,12 @@ class GrillApp(App):
             self.show_heading()
             self.refresh_list()
             await self.fetch_catalog()
+            self.query_one('#chat-scroll', VerticalScroll).anchor()
             self.load_question()
             self.apply_layout()
             self.focus_answer()
-            self.set_interval(.6, self.tick)
+            # Often enough for a streamed reply to read as typing.
+            self.set_interval(.3, self.tick)
             await self.tick()
         except (OSError, ValueError) as exc:
             self.status(f'Не удалось открыть раунд: {exc}. Закройте и повторите open.', error=True)
@@ -781,26 +789,41 @@ class GrillApp(App):
         if self.qid is None:
             return
         branch = self.state['branches'][self.q['id']]
+        scroll = self.query_one('#chat-scroll', VerticalScroll)
+        runtime = self.chat_runtime()
+        agent = HARNESSES[runtime['harness']].label if runtime.get('harness') in HARNESSES else 'Агент'
         fingerprint = json.dumps(branch.get('messages', []), ensure_ascii=False)
         if fingerprint != self.chat_fingerprint:
+            # Another question, the owner's own message, or the owner was already reading at the end.
+            follow = (self.chat_fingerprint is None or scroll.is_vertical_scroll_end
+                      or bool(branch['messages']) and branch['messages'][-1]['role'] == 'user')
             self.chat_fingerprint = fingerprint
-            scroll = self.query_one('#chat-scroll', VerticalScroll)
             scroll.query('.msg').remove()
-            runtime = self.chat_runtime()
-            agent = HARNESSES[runtime['harness']].label if runtime.get('harness') in HARNESSES else 'Агент'
+            self.partial_message, self.partial_text = None, ''
             scroll.mount_all([chat_message(m['role'], m['text'], 'Вы' if m['role'] == 'user' else agent)
                               for m in branch['messages']])
             empty = self.query_one('#chat-empty', Static)
             empty.display = not branch['messages']
             empty.update('Спросите агента об этом вопросе. Он видит только его контекст, '
                          'а переписка не попадёт основному агенту.')
-            scroll.call_after_refresh(scroll.scroll_end, animate=False)
+            if follow:
+                scroll.scroll_end(animate=False)
+        # The anchored scroll follows the growing reply until the owner scrolls up to reread.
+        partial = branch.get('partial', '')
+        if partial != self.partial_text:
+            self.partial_text = partial
+            if self.partial_message and partial:
+                self.partial_message.update(message_body('assistant', partial, agent))
+            elif partial:
+                self.partial_message = chat_message('assistant', partial, agent)
+                scroll.mount(self.partial_message)
+            else:
+                self.partial_message.remove()
+                self.partial_message = None
         status = self.query_one('#chat-status', Static)
         status.set_class(bool(branch.get('error')), '-error')
         progress = ''
         if branch['status'] == 'running':
-            runtime = self.chat_runtime()
-            agent = HARNESSES[runtime['harness']].label if runtime.get('harness') in HARNESSES else 'Агент'
             elapsed = int(time.time() - branch['started_at']) if branch.get('started_at') else 0
             progress = f'{agent} отвечает · {elapsed // 60}:{elapsed % 60:02d}'
             if branch.get('activity'):
