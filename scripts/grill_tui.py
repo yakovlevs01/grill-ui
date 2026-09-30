@@ -509,7 +509,7 @@ class GrillApp(App):
                         yield ChoiceList(id='choices')
                         yield Static('↑↓ Enter выбрать · Enter ещё раз подтвердить · Space снять',
                                      id='choices-hint', classes='hint')
-                    with Horizontal(classes='field-head'):
+                    with Horizontal(id='answer-head', classes='field-head'):
                         yield Label('Ваш ответ', classes='caption')
                         yield Static('Enter сохранить · Shift+Enter перенос', id='answer-hint', classes='hint')
                     yield Composer(id='answer', soft_wrap=True, tab_behavior='focus')
@@ -726,6 +726,9 @@ class GrillApp(App):
             editor = self.query_one('#answer', TextArea)
             editor.read_only = not live
             editor.load_text(answer['text'])
+            # A sent answer given only by choice has no text to show.
+            editor.display = live or bool(answer['text'].strip())
+            self.query_one('#answer-head').display = editor.display
             self.query_one('#message', TextArea).load_text(self.state['branches'][q['id']].get('input_draft', ''))
             self.query_one('#reopen-reason', TextArea).load_text('')
         self.query_one('#question-scroll').scroll_home(animate=False)
