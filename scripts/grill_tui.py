@@ -8,6 +8,8 @@ import json
 import subprocess
 import time
 from pathlib import Path
+from rich.console import Group
+from rich.segment import Segment
 from rich.table import Table
 from rich.text import Text
 from textual import on
@@ -70,9 +72,28 @@ class Composer(TextArea):
         await super()._on_key(event)
 
 
+class ChoiceRow:
+    """An option row; a recommended one gets an amber stripe along its right edge.
+
+    The stripe spans exactly the option's lines, not the gap below it.
+    """
+    def __init__(self, body, recommended, gap):
+        self.body, self.recommended, self.gap = body, recommended, gap
+
+    def __rich_console__(self, console, options):
+        width = options.max_width - (2 if self.recommended else 0)
+        for line in console.render_lines(self.body, options.update_width(width), pad=True):
+            yield from line
+            if self.recommended:
+                yield Segment(' ▐', console.get_style(PALETTE['warn']))
+            yield Segment.line()
+        if self.gap:
+            yield Segment.line()  # Breathing room; a drawn separator would show on a transparent background.
+
+
 class ChoiceList(OptionList):
     """Options with the description under the label; SelectionList shows one line only."""
-    # Space toggles; Enter confirms the answer, as in the answer field.
+    # Space toggles. Enter marks the highlighted option; Enter on a marked one confirms the answer.
     BINDINGS = [Binding('space', 'select', 'Выбрать', show=False),
                 Binding('enter', 'submit', 'Подтвердить', show=False)]
 
@@ -85,14 +106,19 @@ class ChoiceList(OptionList):
         pass
 
     def action_submit(self):
-        self.post_message(self.Submitted())
+        index = self.highlighted
+        if index is not None and self.choices[index]['id'] not in self.selected:
+            self.action_select()
+        else:
+            self.post_message(self.Submitted())
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.choices, self.mode, self.selected = [], 'single', []
+        self.choices, self.mode, self.selected, self.recommended = [], 'single', [], []
 
-    def load(self, options, selected, mode):
+    def load(self, options, selected, mode, recommended=()):
         self.choices, self.mode, self.selected = options, mode, list(selected)
+        self.recommended = list(recommended)
         self.redraw(0)
 
     def redraw(self, highlighted=None):
@@ -104,17 +130,21 @@ class ChoiceList(OptionList):
                 mark = '■' if chosen else '□'
             else:
                 mark = '●' if chosen else '○'
-            text = Text()
-            text.append(o['label'], style=f"bold {PALETTE['accent' if chosen else 'strong']}")
-            if o.get('description'):
-                text.append('\n' + o['description'], style=PALETTE['muted'])
-            if index < len(self.choices) - 1:
-                text.append('\n')  # Breathing room; a drawn separator would show on a transparent background.
-            row = Table.grid(padding=(0, 1))
+            recommended = o['id'] in self.recommended
+            title = Text(o['label'], style=f"bold {PALETTE['accent' if chosen else 'strong']}")
+            if recommended:
+                # The circle and the blue belong to the owner's choice; the model's advice stays amber, on the right.
+                head = Table.grid(padding=(0, 1), expand=True)
+                head.add_column(ratio=1)
+                head.add_column(justify='right')
+                head.add_row(title, Text('совет агента', style=PALETTE['warn']))
+                title = head
+            body = Group(title, Text(o['description'], style=PALETTE['muted'])) if o.get('description') else title
+            row = Table.grid(padding=(0, 1), expand=True)
             row.add_column(width=1)
             row.add_column(ratio=1)
-            row.add_row(Text(mark, style=PALETTE['accent' if chosen else 'faint']), text)
-            self.add_option(row)
+            row.add_row(Text(mark, style=PALETTE['accent' if chosen else 'faint']), body)
+            self.add_option(ChoiceRow(row, recommended, index < len(self.choices) - 1))
         if self.choices:
             self.highlighted = min(highlighted or 0, len(self.choices) - 1)
 
@@ -320,6 +350,7 @@ class GrillApp(App):
     #choices > .option-list--option-highlighted { background: ansi_default; text-style: none; }
     #choices:focus > .option-list--option-highlighted { background: $surface; }
     #choices > .option-list--option-hover { background: $surface; }
+    #choices-hint { width: 1fr; height: auto; max-width: 96; margin-top: 1; padding: 0 1; }
 
     .field-head { height: 1; margin-top: 1; }
     .field-head .caption { width: 1fr; }
@@ -416,6 +447,8 @@ class GrillApp(App):
                     yield Static('', id='question-body', markup=False)
                     yield Static('', id='recommendation')
                     yield ChoiceList(id='choices')
+                    yield Static('↑↓ Enter выбрать · Enter ещё раз подтвердить · Space снять',
+                                 id='choices-hint', classes='hint')
                 with Horizontal(classes='field-head'):
                     yield Label('Ваш ответ', classes='caption')
                     yield Static('Enter сохранить · Shift+Enter перенос', classes='hint')
@@ -541,8 +574,10 @@ class GrillApp(App):
             ('Рекомендация', f"bold {PALETTE['accent']}"), '\n', q['recommendation']))
         choices = self.query_one('#choices', ChoiceList)
         with self.prevent(TextArea.Changed):
-            choices.load(q.get('options', []), answer['selected'], q.get('mode', 'single'))
+            choices.load(q.get('options', []), answer['selected'], q.get('mode', 'single'),
+                         q.get('recommended', []))
             choices.display = q.get('mode') != 'text' and bool(q.get('options'))
+            self.query_one('#choices-hint').display = choices.display
             self.query_one('#answer', TextArea).load_text(answer['text'])
             self.query_one('#message', TextArea).load_text(self.state['branches'][q['id']].get('input_draft', ''))
         self.query_one('#question-scroll').scroll_home(animate=False)

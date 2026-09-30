@@ -65,6 +65,11 @@ def validate_round(doc):
                     and opt['label'], 'Option needs id and label')
             require(opt['id'] not in ids, 'Duplicate option ID')
             ids.add(opt['id'])
+        recommended = q.get('recommended', [])
+        require(isinstance(recommended, list) and set(recommended) <= ids,
+                'Recommended must list option IDs of the question')
+        require(q.get('mode', 'single') != 'single' or len(recommended) <= 1,
+                'A single-choice question recommends at most one option')
     for q in doc['questions']:
         require(not set(q.get('depends_on', [])) & seen,
                 'Frontier contains dependent questions; move dependents to next round')

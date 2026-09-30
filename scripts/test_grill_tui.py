@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from rich.console import Console
 from textual.widgets import Button, Input, Select, TextArea
 import grill_ui as g
 from grill_tui import ChoiceList, GrillApp, CUSTOM
@@ -181,12 +182,14 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.store.state['answers']['Q1'], {'selected': [], 'text': 'Да', 'confirmed': True})
             self.assertEqual(app.q['id'], 'Q2')
             self.assertIs(app.focused, app.query_one('#choices'))
-            await pilot.press('enter')  # Nothing chosen yet: Enter does nothing.
+            # Enter marks the highlighted option; Enter on a marked one confirms.
+            await pilot.press('enter', 'down', 'enter')
             await pilot.pause()
-            self.assertEqual((app.q['id'], self.store.state['answers']['Q2']['confirmed']), ('Q2', False))
-            await pilot.press('space', 'enter')
+            self.assertEqual(app.state['answers']['Q2'], {'selected': ['title', 'note'], 'text': '', 'confirmed': False})
+            self.assertEqual(app.q['id'], 'Q2')
+            await pilot.press('enter')
             await pilot.pause()
-            self.assertEqual(self.store.state['answers']['Q2'], {'selected': ['title'], 'text': '', 'confirmed': True})
+            self.assertEqual(self.store.state['answers']['Q2'], {'selected': ['title', 'note'], 'text': '', 'confirmed': True})
             self.assertEqual(app.q['id'], 'Q3')
             self.assertIs(app.focused, app.query_one('#answer'))
             await pilot.press('shift+enter', 'О', 'К', 'enter')
@@ -262,6 +265,32 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(restored.query_one('#center').display)
             self.assertFalse(restored.query_one('#questions').display)
             self.assertFalse(restored.query_one('#discussion').display)
+
+    async def test_arrows_and_enter_pick_single_option_and_recommendation_is_a_tag(self):
+        app = GrillApp(self.fixture.root, self.api)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause()
+            choices = app.query_one('#choices', ChoiceList)
+            self.assertIs(app.focused, choices)
+            self.assertEqual(choices.recommended, ['local'])
+            console = Console(width=80, color_system=None)
+            with console.capture() as shot:
+                console.print(choices.get_option_at_index(0).prompt, choices.get_option_at_index(1).prompt)
+            first, second = shot.get().split('\n\n')[:2]
+            self.assertIn('совет агента', first)
+            self.assertTrue(all(line.endswith('▐') for line in first.splitlines()))
+            self.assertNotIn('▐', second)
+            self.assertEqual(choices.selected, [])  # Recommended, not chosen.
+            await pilot.press('down', 'enter')
+            await pilot.pause()
+            self.assertEqual((choices.selected, app.state['answers']['Q1']['confirmed']), (['sync'], False))
+            await pilot.press('up', 'enter')
+            await pilot.pause()
+            self.assertEqual((choices.selected, app.state['answers']['Q1']['confirmed']), (['local'], False))
+            await pilot.press('enter')
+            await pilot.pause()
+            self.assertEqual(self.store.state['answers']['Q1'], {'selected': ['local'], 'text': '', 'confirmed': True})
+            self.assertEqual(app.q['id'], 'Q2')
 
     async def test_single_selection_edit_unconfirms_and_summary_is_explicit(self):
         app = GrillApp(self.fixture.root, self.api)

@@ -51,6 +51,13 @@ class RoundTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'dependent'):
             g.validate_round(self.doc)
 
+    def test_recommended_must_name_options(self):
+        g.validate_round(self.doc)
+        for value in (['missing'], ['local', 'sync'], 'local'):
+            self.doc['questions'][0]['recommended'] = value
+            with self.assertRaisesRegex(ValueError, '(?i)recommend'):
+                g.validate_round(self.doc)
+
     def test_answer_contract(self):
         for value in ({'selected': [], 'text': '', 'confirmed': True},
                       {'selected': ['missing'], 'text': ''},
