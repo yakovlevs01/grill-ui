@@ -54,6 +54,10 @@ class Harness:
         """A short phrase for what the agent is doing now, or None."""
         return None
 
+    def partial(self, event, text):
+        """The reply shown so far, `text`, grown by one event, or None."""
+        return None
+
     def entry(self, models, efforts):
         return {'id': self.id, 'label': self.label, 'available': self.available(),
                 'models': models, 'efforts': efforts}
@@ -110,7 +114,9 @@ class Codex(Harness):
     def command(self, runtime, session):
         cmd = [self.binary, 'exec', '-m', runtime['model'],
                '-c', 'model_reasoning_effort=' + json.dumps(runtime['effort']),
-               '-c', 'sandbox_mode="read-only"', '-c', 'approval_policy="never"']
+               '-c', 'sandbox_mode="read-only"', '-c', 'approval_policy="never"',
+               # `--search` exists only on the interactive CLI; exec takes the config key.
+               '-c', 'web_search="live"']
         if runtime.get('service_tier'):
             cmd += ['-c', 'service_tier=' + json.dumps(runtime['service_tier'])]
         if session:
@@ -132,6 +138,12 @@ class Codex(Harness):
         return {'reasoning': 'думает', 'file_change': 'меняет файлы', 'web_search': 'ищет в интернете',
                 'mcp_tool_call': 'вызывает ' + short(item.get('tool', 'инструмент'), 40),
                 'agent_message': 'пишет ответ'}.get(kind)
+
+    def partial(self, event, text):
+        # exec --json has no text deltas; each finished message shows at once.
+        if event.get('type') == 'item.completed' and event.get('item', {}).get('type') == 'agent_message':
+            return (text + '\n\n' if text else '') + event['item'].get('text', '')
+        return None
 
     def parse(self, event):
         """Return (session ID, assistant text, failure) found in one event."""
@@ -190,15 +202,22 @@ class Claude(Harness):
         return self.entry(models, efforts)
 
     def command(self, runtime, session):
-        cmd = [self.binary, '-p', '--output-format', 'stream-json', '--verbose',
+        cmd = [self.binary, '-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages',
                '--model', runtime['model'], '--effort', runtime['effort'],
-               # Read-only discussion: no edits, shell, MCP servers or skills.
-               '--tools', 'Read,Grep,Glob', '--strict-mcp-config', '--disable-slash-commands']
+               # Read-only discussion: files and the web, no edits, shell, MCP servers or skills.
+               # Web tools ask permission, which print mode cannot grant without --allowedTools.
+               '--tools', 'Read,Grep,Glob,WebSearch,WebFetch', '--allowedTools', 'WebSearch,WebFetch',
+               '--strict-mcp-config', '--disable-slash-commands']
         if session:
             cmd += ['--resume', session]
         return cmd
 
     def activity(self, event):
+        # A whole `assistant` event comes only when its text ends; the stream says when it starts.
+        inner = event.get('event') or {}
+        if (event.get('type') == 'stream_event' and inner.get('type') == 'content_block_start'
+                and (inner.get('content_block') or {}).get('type') == 'text'):
+            return 'пишет ответ'
         if event.get('type') != 'assistant':
             return None
         blocks = (event.get('message') or {}).get('content') or []
@@ -213,6 +232,10 @@ class Claude(Harness):
                     found = 'ищет «' + short(args.get('pattern', ''), 40) + '»'
                 elif name == 'Glob':
                     found = 'ищет файлы ' + short(args.get('pattern', ''), 40)
+                elif name == 'WebSearch':
+                    found = 'ищет в интернете «' + short(args.get('query', ''), 40) + '»'
+                elif name == 'WebFetch':
+                    found = 'читает ' + short(args.get('url', ''), 50)
                 else:
                     found = 'вызывает ' + short(name, 40)
             elif kind == 'thinking':
@@ -220,6 +243,18 @@ class Claude(Harness):
             elif kind == 'text':
                 found = 'пишет ответ'
         return found
+
+    def partial(self, event, text):
+        # --include-partial-messages wraps raw API stream events; subagent events are not the reply.
+        if event.get('type') != 'stream_event' or event.get('parent_tool_use_id'):
+            return None
+        inner = event.get('event') or {}
+        if inner.get('type') == 'content_block_start' and (inner.get('content_block') or {}).get('type') == 'text':
+            return text + '\n\n' if text else None
+        delta = inner.get('delta') or {}
+        if inner.get('type') == 'content_block_delta' and delta.get('type') == 'text_delta':
+            return text + delta.get('text', '')
+        return None
 
     def parse(self, event):
         kind = event.get('type')
