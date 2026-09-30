@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from rich.console import Group
 from rich.segment import Segment
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 from textual import on
@@ -19,6 +20,7 @@ from textual.drivers.linux_driver import LinuxDriver
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
+from textual.strip import Strip
 from textual.widgets import Button, Footer, Input, Label, OptionList, Select, Static, TextArea
 from grill_client import Client
 from grill_harness import HARNESSES, label
@@ -75,20 +77,21 @@ class Composer(TextArea):
 class ChoiceRow:
     """An option row; a recommended one gets an amber stripe along its right edge.
 
-    The stripe spans exactly the option's lines, not the gap below it.
+    Only the owner's chosen option is filled; the fill and the stripe span
+    exactly the option's lines, from the left gutter to the right edge.
     """
-    def __init__(self, body, recommended, gap):
-        self.body, self.recommended, self.gap = body, recommended, gap
+    def __init__(self, body, recommended, chosen):
+        self.body, self.recommended, self.chosen = body, recommended, chosen
 
     def __rich_console__(self, console, options):
-        width = options.max_width - (2 if self.recommended else 0)
-        for line in console.render_lines(self.body, options.update_width(width), pad=True):
+        fill = Style(bgcolor=PALETTE['surface']) if self.chosen else Style()
+        width = options.max_width - 1 - (2 if self.recommended else 0)
+        for line in console.render_lines(self.body, options.update_width(width), style=fill, pad=True):
+            yield Segment(' ', fill)  # Left gutter; the cursor bar replaces it.
             yield from line
             if self.recommended:
-                yield Segment(' ▐', console.get_style(PALETTE['warn']))
+                yield Segment(' ▐', fill + Style(color=PALETTE['warn']))
             yield Segment.line()
-        if self.gap:
-            yield Segment.line()  # Breathing room; a drawn separator would show on a transparent background.
 
 
 class ChoiceList(OptionList):
@@ -144,9 +147,35 @@ class ChoiceList(OptionList):
             row.add_column(width=1)
             row.add_column(ratio=1)
             row.add_row(Text(mark, style=PALETTE['accent' if chosen else 'faint']), body)
-            self.add_option(ChoiceRow(row, recommended, index < len(self.choices) - 1))
+            self.add_option(ChoiceRow(row, recommended, chosen))
+            if index < len(self.choices) - 1:
+                self.add_option(None)  # The gap below belongs to no option, so no fill or stripe reaches it.
         if self.choices:
             self.highlighted = min(highlighted or 0, len(self.choices) - 1)
+
+    # Private Textual hooks (pinned 8.2.8): the separator is drawn as the last
+    # line of the option above it; a blank line reads as a gap on any background.
+    def _get_option_render(self, option, style):
+        strips = super()._get_option_render(option, style)
+        if option._divider:
+            strips = [*strips[:-1], Strip.blank(strips[-1].cell_length, Style())]
+        return strips
+
+    def render_line(self, y):
+        """Mark the cursor with an accent bar in the left gutter instead of a fill."""
+        strip = super().render_line(y)
+        try:
+            index, offset = self._lines[self.scroll_offset.y + y]
+        except IndexError:
+            return strip
+        if index != self.highlighted or not self.has_focus:
+            return strip
+        height = sum(1 for line_index, _ in self._lines if line_index == index)
+        if self.options[index]._divider and offset == height - 1:
+            return strip  # The gap below the option stays blank.
+        gutter = next(iter(strip), None)
+        bar = (gutter.style if gutter and gutter.style else Style()) + Style(color=PALETTE['accent'])
+        return Strip.join([Strip([Segment('▌', bar)], 1), strip.crop(1)])
 
     @on(OptionList.OptionSelected)
     def toggle(self, event):
@@ -340,24 +369,29 @@ class GrillApp(App):
     #question-scroll { height: 1fr; scrollbar-size-vertical: 1; }
     #question-meta { height: 1; color: $muted; }
     #question-title { height: auto; color: $strong; text-style: bold; margin: 1 0 1 0; }
-    #question-body { height: auto; max-width: 96; }
+    #question-body { height: auto; max-width: 96; padding: 0 1; background: $surface; }
     #recommendation { height: auto; max-width: 96; margin-top: 1; padding: 0 1;
-                      background: $surface; border-left: outer $accent; }
+                      border-left: outer $accent; }
     #choices { height: auto; max-height: 20; margin-top: 1; max-width: 96;
                background: $bg; border: none; padding: 0; }
     #choices, #choices:focus { background: ansi_default; }
-    #choices > .option-list--option { padding: 0 1; }
-    #choices > .option-list--option-highlighted { background: ansi_default; text-style: none; }
-    #choices:focus > .option-list--option-highlighted { background: $surface; }
-    #choices > .option-list--option-hover { background: $surface; }
+    /* Only the owner's chosen option is filled (ChoiceRow); the cursor is a bar in the gutter. */
+    #choices > .option-list--option { padding: 0; }
+    #choices > .option-list--option-highlighted,
+    #choices:focus > .option-list--option-highlighted,
+    #choices > .option-list--option-hover { background: ansi_default; text-style: none; }
     #choices-hint { width: 1fr; height: auto; max-width: 96; margin-top: 1; padding: 0 1; }
 
     .field-head { height: 1; margin-top: 1; }
     .field-head .caption { width: 1fr; }
     .hint { width: auto; color: $faint; }
-    TextArea { height: 6; background: $surface; border: tall $surface; padding: 0 1; }
-    TextArea:focus { border: tall $accent; }
-    TextArea > .text-area--cursor-line { background: $surface; }
+    /* Fields stay transparent; the answer is filled once it holds text, like a chosen option. */
+    TextArea { height: 6; background: ansi_default; border: round $line-strong; padding: 0 1; }
+    TextArea:focus { border: round $accent; }
+    TextArea > .text-area--cursor-line { background: ansi_default; }
+    #answer.-filled, #answer.-filled > .text-area--cursor-line { background: $surface; }
+    #answer.-filled { border: tall $surface; }
+    #answer.-filled:focus { border: tall $accent; }
     #answer { height: 7; }
     #answer-actions { height: 1; margin: 1 0 1 0; }
     #answer-state { width: 1fr; color: $muted; }
@@ -370,10 +404,10 @@ class GrillApp(App):
     #agent-row Select { width: 1fr; margin-right: 1; }
     #agent-harness { max-width: 16; }
     #agent-effort { max-width: 12; margin-right: 0; }
-    #agent-row SelectCurrent { background: $raised; color: $text; border: none; padding: 0 1; }
+    #agent-row SelectCurrent { background: ansi_default; color: $text; border: none; padding: 0 1; }
     #agent-row Select:focus > SelectCurrent { background: $accent-dim; color: $strong; }
     #agent-row SelectOverlay { background: $raised; border: tall $line-strong; }
-    #agent-custom { margin-top: 1; background: $raised; border: none; }
+    #agent-custom { margin-top: 1; background: ansi_default; border: none; }
     #agent-custom:focus { background: $accent-dim; }
     #agent-chat { height: auto; margin-top: 1; }
     #agent-note { width: 1fr; height: auto; color: $muted; }
@@ -597,6 +631,7 @@ class GrillApp(App):
         self.query_one('#return', Button).variant = 'success' if submitted else 'default'
         self.query_one('#agent-picker').disabled = submitted
         answer = self.state['answers'][self.q['id']]
+        self.query_one('#answer').set_class(bool(answer['text'].strip()), '-filled')
         confirmed = answer['confirmed']
         self.query_one('#confirm', Button).label = 'Подтверждено ✓' if confirmed else 'Подтвердить ответ'
         state = self.query_one('#answer-state', Static)
