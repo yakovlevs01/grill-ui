@@ -845,31 +845,37 @@ class GrillApp(App):
                 self.draft_dirty.discard(qid)
         self.checkpoint()
 
+    def merge(self, latest):
+        """Take the server's grill, keeping the owner's unsent edits."""
+        added = len(latest['rounds']) > len(self.state['rounds'])
+        for qid, branch in latest['branches'].items():
+            # The message field is the owner's until it reaches the server.
+            if qid in self.state['branches']:
+                branch['input_draft'] = self.state['branches'][qid].get('input_draft', '')
+            self.state['branches'][qid] = branch
+        for qid, answer in latest['answers'].items():
+            if qid not in self.dirty:
+                self.state['answers'][qid] = answer
+        for key in ('rounds', 'submitted_rounds', 'submissions', 'reopen', 'numbers', 'finished', 'runtime', 'version'):
+            self.state[key] = latest[key]
+        if added:
+            # The agent added the next round to this tab: go to its first question.
+            self.submit_notice = None
+            self.start_view()
+            self.show_heading()
+            self.show_question(self.qid)
+            self.focus_answer()
+            self.notify(self.state['rounds'][-1]['title'], title=f"Раунд {len(self.state['rounds'])}", timeout=10)
+
     async def tick(self):
         if not self.state:
             return
         try:
             await self.flush()
-            latest = await self.api('/api/state')
-            added = len(latest['rounds']) > len(self.state['rounds'])
-            for qid, branch in latest['branches'].items():
-                # The message field is the owner's until it reaches the server.
-                if qid in self.state['branches']:
-                    branch['input_draft'] = self.state['branches'][qid].get('input_draft', '')
-                self.state['branches'][qid] = branch
-            for qid, answer in latest['answers'].items():
-                if qid not in self.dirty:
-                    self.state['answers'][qid] = answer
-            for key in ('rounds', 'submitted_rounds', 'submissions', 'reopen', 'numbers', 'finished', 'runtime'):
-                self.state[key] = latest[key]
-            if added:
-                # The agent added the next round to this tab: go to its first question.
-                self.submit_notice = None
-                self.start_view()
-                self.show_heading()
-                self.show_question(self.qid)
-                self.focus_answer()
-                self.notify(self.state['rounds'][-1]['title'], title=f"Раунд {len(self.state['rounds'])}", timeout=10)
+            # The server answers «unchanged» while nothing moved; elapsed time still ticks here.
+            latest = await self.api(f"/api/state?since={self.state.get('version', '')}")
+            if not latest.get('unchanged'):
+                self.merge(latest)
             if not self.catalog.get('ready') and time.monotonic() - self.catalog_checked > 5:
                 # The server lists models in the background; pick them up once ready.
                 self.catalog_checked = time.monotonic()

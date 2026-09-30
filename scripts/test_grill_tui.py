@@ -33,8 +33,8 @@ class LocalAPI:
         if self.offline:
             raise OSError('offline')
         qid = (data or {}).get('question_id')
-        if path == '/api/state':
-            return self.store.snapshot()
+        if path.startswith('/api/state'):
+            return self.store.snapshot(path.partition('since=')[2] or None)
         if path == '/api/answer':
             self.store.answer(qid, data)
         elif path == '/api/draft':
@@ -476,6 +476,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('ищет в интернете', status)
             self.assertTrue(scroll.is_vertical_scroll_end)
             branch['partial'] = 'Начало и продолжение\n' * 5
+            self.store.touch()  # The server bumps the version with each streamed chunk.
             await app.tick()
             await pilot.pause()
             self.assertIs(app.partial_message, streamed)  # Updated in place, the history is not redrawn.
@@ -485,6 +486,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             scroll.scroll_home(animate=False)
             await pilot.pause()
             branch['partial'] += 'ещё\n' * 5
+            self.store.touch()
             await app.tick()
             await pilot.pause()
             await pilot.pause()  # Scrolling waits for the refresh after the update.
@@ -493,6 +495,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             scroll.scroll_end(animate=False)
             await pilot.pause()
             branch['partial'] += 'и ещё\n' * 5
+            self.store.touch()
             await app.tick()
             await pilot.pause()
             await pilot.pause()
@@ -500,6 +503,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             # The final reply replaces the streamed one.
             branch['messages'].append({'role': 'assistant', 'text': 'Итог'})
             branch.update(partial='', status='idle', activity='', started_at=None)
+            self.store.touch()
             await app.tick()
             await pilot.pause()
             self.assertIsNone(app.partial_message)

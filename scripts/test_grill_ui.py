@@ -224,9 +224,22 @@ print(json.dumps({'models': [
             state = json.loads(request('/api/state')[1])
             self.assertEqual([r['id'] for r in state['rounds']], ['demo-r1', 'r2'])
             self.assertEqual(state['numbers']['Q4'], 4)
+            # A TUI holding the current version gets only a mark, not the whole grill.
+            unchanged = json.loads(request('/api/state?since=' + state['version'])[1])
+            self.assertEqual(unchanged, {'unchanged': True, 'version': state['version']})
         finally:
             proc.send_signal(signal.SIGTERM)
             proc.communicate(timeout=5)
+
+    def test_state_version_changes_with_every_visible_change(self):
+        first = self.store.snapshot()
+        self.assertEqual(self.store.snapshot(first['version']), {'unchanged': True, 'version': first['version']})
+        self.store.answer('Q1', {'selected': ['local'], 'text': '', 'confirmed': False})
+        second = self.store.snapshot(first['version'])
+        self.assertNotIn('unchanged', second)
+        self.assertEqual(second['answers']['Q1']['selected'], ['local'])
+        # A restarted server never repeats a version the TUI holds.
+        self.assertNotEqual(g.Store(self.root).snapshot()['version'], second['version'])
 
     def test_rounds_share_one_session_with_global_numbers(self):
         with self.assertRaisesRegex(ValueError, 'Submit the current round'):

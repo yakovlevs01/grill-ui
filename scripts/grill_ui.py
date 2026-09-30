@@ -15,6 +15,7 @@ import threading
 import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 import grill_harness
 from grill_client import Client
 from grill_harness import HARNESSES
@@ -197,6 +198,9 @@ class Store:
         self.catalog = None
         self.catalog_ready = threading.Event()
         self.save_due = False
+        # Bumped on every change the TUI can see; starts from the clock so a restarted
+        # server never repeats a version the TUI already holds.
+        self.version = time.time_ns()
         # Sessions created before harness choice were Codex-only.
         self.state['runtime'].setdefault('harness', 'codex')
         # What init resolved from the caller; the owner may pick another agent later.
@@ -211,20 +215,28 @@ class Store:
                               partial='')
         self.save()
 
+    def touch(self):
+        self.version += 1
+
     def save(self):
         self.save_due = False
+        self.touch()
         write(self.path / 'state.json', self.state)
         write(self.path / 'status.json', summary(self.state, self.path))
 
-    def snapshot(self):
+    def snapshot(self, since=None):
+        """The whole grill, or only a mark when the TUI already holds this version."""
         with self.lock:
-            return {**copy.deepcopy(self.state), 'numbers': numbers(self.state)}
+            if since == str(self.version):
+                return {'unchanged': True, 'version': since}
+            return {**copy.deepcopy(self.state), 'numbers': numbers(self.state), 'version': str(self.version)}
 
     def locate(self, qid):
         return next((doc, q) for doc in self.state['rounds'] for q in doc['questions'] if q['id'] == qid)
 
     def save_soon(self):
         """One write for a burst of changes, such as streamed text; call under the lock."""
+        self.touch()
         if not self.save_due:
             self.save_due = True
             timer = threading.Timer(.3, self.save_pending)
@@ -420,6 +432,7 @@ class Store:
                         with self.lock:
                             if activity:
                                 branch['activity'] = activity
+                                self.touch()
                             if grown is not None:
                                 branch['partial'] = grown
                                 # The TUI reads memory; the file only needs to catch up.
@@ -527,9 +540,10 @@ def serve(args):
                 if self.path == '/api/health':
                     self.authorized()
                     self.respond(200, {'instance': instance, 'session': str(store.path)})
-                elif self.path == '/api/state':
+                elif urlsplit(self.path).path == '/api/state':
                     self.authorized()
-                    self.respond(200, store.snapshot())
+                    since = parse_qs(urlsplit(self.path).query).get('since', [None])[0]
+                    self.respond(200, store.snapshot(since))
                 elif self.path == '/api/catalog':
                     self.authorized()
                     # Stay under the client's 3 s timeout; a late catalog is only a hint.
