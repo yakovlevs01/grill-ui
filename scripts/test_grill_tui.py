@@ -72,6 +72,46 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         self.path.stop()
         self.fixture.tearDown()
 
+    async def test_many_choices_use_available_height(self):
+        question = self.store.state['rounds'][0]['questions'][0]
+        question['options'] = [
+            {'id': f'option-{i}', 'label': f'Вариант {i}',
+             'description': 'Описание варианта в отдельной строке.'}
+            for i in range(10)
+        ]
+        question['recommended'] = ['option-0']
+        app = GrillApp(self.fixture.root, self.api)
+        async with app.run_test(size=(180, 70)) as pilot:
+            await pilot.pause()
+            choices = app.query_one('#choices', ChoiceList)
+            question_scroll = app.query_one('#question-scroll')
+            self.assertGreater(choices.size.height, 20)
+            self.assertFalse(choices.show_vertical_scrollbar)
+            self.assertFalse(question_scroll.show_vertical_scrollbar)
+            self.assertLessEqual(choices.region.bottom, app.query_one('#answer-head').region.y)
+
+            # Scroll only when the choices exceed the available viewport.
+            await pilot.resize_terminal(180, 35)
+            await pilot.pause()
+            self.assertTrue(choices.show_vertical_scrollbar)
+            self.assertTrue(question_scroll.show_vertical_scrollbar)
+            await pilot.press('end')
+            await pilot.pause()
+            self.assertEqual(choices.highlighted, 9)
+            self.assertTrue(choices.is_vertical_scroll_end)
+            await pilot.press('enter')
+            await pilot.pause()
+            self.assertEqual(self.store.state['answers']['Q1']['selected'], ['option-9'])
+            await pilot.press('f4', 'Д', 'а')
+            await pilot.pause()
+            answer = app.query_one('#answer', TextArea)
+            self.assertEqual(answer.text, 'Да')
+            self.assertLessEqual(answer.region.bottom, app.size.height)
+            await pilot.resize_terminal(180, 70)
+            await pilot.pause()
+            self.assertFalse(choices.show_vertical_scrollbar)
+            self.assertFalse(question_scroll.show_vertical_scrollbar)
+
     async def test_agent_picker_sets_new_chats_and_restarts_on_request(self):
         self.store.state['branches']['Q2'].update(thread_id='codex-thread', runtime=dict(self.store.state['runtime']),
                                                   messages=[{'role': 'user', 'text': 'Старый чат'}])

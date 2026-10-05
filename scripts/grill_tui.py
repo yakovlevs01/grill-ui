@@ -380,7 +380,8 @@ class GrillApp(App):
     #question-body { height: auto; max-width: 96; }
     #recommendation { height: auto; max-width: 96; margin-top: 1; padding: 0 1;
                       border-left: outer $accent; }
-    #choices { height: auto; max-height: 20; margin-top: 1; max-width: 96;
+    /* Grow with the content; only cap at the available question viewport. */
+    #choices { height: auto; max-height: 100%; margin-top: 1; max-width: 96;
                background: ansi_default; border: none; padding: 0; }
     #choices, #choices:focus { background: ansi_default; }
     /* The chosen option shows by its mark and color; the cursor is a bar in the gutter. */
