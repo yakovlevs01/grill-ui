@@ -164,31 +164,34 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(app.query_one('#answer', TextArea).text, 'Привет\nМир\n!')
             self.assertFalse(self.store.state['answers']['Q1']['confirmed'])
-            await pilot.click('#confirm')
-            await pilot.pause()
-            self.assertTrue(self.store.state['answers']['Q1']['confirmed'])
-            self.assertEqual(self.store.state['answers']['Q1']['selected'], ['local'])
             app.query_one('#message', TextArea).load_text('Обсудим Q1')
             await pilot.pause()
             await pilot.click('#send')
             await pilot.pause()
             self.assertEqual(len(self.store.state['branches']['Q1']['messages']), 2)
-            # Switch using the list, preserve the first answer and isolate chats.
-            listing = app.query_one('#question-list')
-            listing.focus()
-            await pilot.press('down', 'enter')
+            # The button confirms and moves on, like Enter; each question keeps its own chat.
+            await pilot.click('#confirm')
             await pilot.pause()
+            self.assertTrue(self.store.state['answers']['Q1']['confirmed'])
+            self.assertEqual(self.store.state['answers']['Q1']['selected'], ['local'])
             self.assertEqual(app.q['id'], 'Q2')
+            self.assertIs(app.focused, app.query_one('#choices'))
             self.assertEqual(app.query_one('#message', TextArea).text, '')
             app.query_one('#answer', TextArea).load_text('Название и заметку')
             await pilot.pause()
             await pilot.click('#confirm')
-            listing.focus()
-            await pilot.press('down', 'enter')
             await pilot.pause()
+            self.assertEqual(app.q['id'], 'Q3')
+            # An empty answer stays put and says why.
+            await pilot.click('#confirm')
+            await pilot.pause()
+            self.assertEqual(app.q['id'], 'Q3')
+            self.assertTrue(any('Выберите вариант' in str(n.message) for n in app._notifications))
             app.query_one('#answer', TextArea).load_text('Вернуться к трём статьям')
             await pilot.pause()
             await pilot.click('#confirm')
+            await pilot.pause()
+            self.assertIs(app.focused, app.query_one('#submit'))
             await pilot.click('#submit')
             await pilot.pause()
             result = g.read(g.read(self.fixture.root/'status.json')['result_file'])
@@ -257,6 +260,44 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.query_one('#message', TextArea).text, '')
             self.assertEqual(len(app.query('.msg')), 2)
             self.assertEqual(len(app.query('.msg-user')), 1)
+
+    async def test_arrows_move_between_the_list_and_the_question(self):
+        app = GrillApp(self.fixture.root, self.api)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause()
+            choices, answer = app.query_one('#choices', ChoiceList), app.query_one('#answer', TextArea)
+            listing = app.query_one('#question-list', OptionList)
+            self.assertIs(app.focused, choices)
+            # ← from the options goes to the list; ↑↓ there show the question under the cursor.
+            await pilot.press('left')
+            await pilot.pause()
+            self.assertEqual((app.focused, listing.highlighted), (listing, 1))
+            await pilot.press('left', 'down')
+            await pilot.pause()
+            self.assertEqual((app.focused, app.q['id']), (listing, 'Q2'))
+            # → returns to the question, where ↑↓ go through its options.
+            await pilot.press('right', 'down', 'enter', 'right')
+            await pilot.pause()
+            self.assertIs(app.focused, choices)
+            self.assertEqual(app.state['answers']['Q2']['selected'], ['note'])
+            # In a text answer ← moves the cursor and leaves only from the very start.
+            await pilot.press('left', 'down', 'right', 'О', 'К', 'left', 'left')
+            await pilot.pause()
+            self.assertEqual((app.focused, app.q['id']), (answer, 'Q3'))
+            await pilot.press('left')
+            await pilot.pause()
+            self.assertIs(app.focused, listing)
+            self.assertEqual(app.state['answers']['Q3']['text'], 'ОК')
+            # Narrow, the two columns take turns on the screen.
+            await pilot.resize_terminal(85, 32)
+            await pilot.pause()
+            await pilot.press('right')
+            await pilot.pause()
+            self.assertEqual((app.query_one('#questions').display, app.query_one('#center').display), (False, True))
+            await pilot.press('left')
+            await pilot.pause()
+            self.assertEqual((app.query_one('#questions').display, app.query_one('#center').display), (True, False))
+            self.assertIs(app.focused, listing)
 
     async def test_f2_and_f7_hide_panels_until_pressed_again(self):
         app = GrillApp(self.fixture.root, self.api)
@@ -363,6 +404,8 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(choices.selected, ['sync'])
             await app.action_confirm()
+            self.assertEqual(app.q['id'], 'Q2')
+            app.show_question('Q1')
             app.query_one('#answer', TextArea).load_text('С оговоркой')
             await pilot.pause()
             self.assertFalse(app.state['answers']['Q1']['confirmed'])
@@ -384,7 +427,8 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(150, 45)) as pilot:
             await pilot.pause()
             self.assertIsNone(app.qid)  # Opened between rounds: the waiting screen.
-            self.assertEqual(app.rows, ['', 'Q1', 'Q2', 'Q3', None])
+            # The sent round stays unfolded until the next one comes.
+            self.assertEqual(app.rows, [1, 'Q1', 'Q2', 'Q3', None])
             # The agent adds the next round to the live session; the tab follows by itself.
             self.store.add_round(test_grill_ui.next_round())
             await app.tick()
@@ -392,13 +436,11 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.q['id'], 'Q4')
             self.assertIs(app.focused, app.query_one('#answer'))
             listing = app.query_one('#question-list', OptionList)
-            self.assertEqual(app.rows, ['', 'Q1', 'Q2', 'Q3', '', 'Q4', 'Q5'])
-            self.assertEqual(listing.highlighted, 5)
-            self.assertIn('Раунд 1 · отправлен', plain(listing.get_option_at_index(0).prompt))
-            self.assertIn('Раунд 2 · текущий', plain(listing.get_option_at_index(4).prompt))
-            self.assertTrue(listing.get_option_at_index(4).disabled)
-            self.assertIn('✓ 2. Что сохранять', plain(listing.get_option_at_index(2).prompt))
-            self.assertIn('○ 4. Вопрос Q4', plain(listing.get_option_at_index(5).prompt))
+            self.assertEqual(app.rows, [1, 2, 'Q4', 'Q5'])
+            self.assertEqual(listing.highlighted, 2)
+            self.assertIn('▸ Раунд 1 · отправлен', plain(listing.get_option_at_index(0).prompt))
+            self.assertIn('▾ Раунд 2 · текущий', plain(listing.get_option_at_index(1).prompt))
+            self.assertIn('○ 4. Вопрос Q4', plain(listing.get_option_at_index(2).prompt))
             meta = str(app.query_one('#question-meta').render())
             self.assertIn('Вопрос 4', meta)
             self.assertIn('Раунд 2', meta)
@@ -406,11 +448,25 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             await pilot.press('Д', 'а', 'enter')
             await pilot.pause()
             self.assertEqual(app.q['id'], 'Q5')
-            # Arrows skip round headers.
+            # Arrows reach the round headers; Enter unfolds one and lands on its first question.
             listing.focus()
-            listing.highlighted = 5
-            await pilot.press('up')
-            self.assertEqual(listing.highlighted, 3)
+            await pilot.press('up', 'up', 'up', 'enter')
+            await pilot.pause()
+            self.assertEqual(app.rows, [1, 'Q1', 'Q2', 'Q3', 2, 'Q4', 'Q5'])
+            self.assertEqual((listing.highlighted, app.q['id']), (1, 'Q1'))
+            self.assertIn('▾ Раунд 1', plain(listing.get_option_at_index(0).prompt))
+            self.assertIn('✓ 2. Что сохранять', plain(listing.get_option_at_index(2).prompt))
+            # Enter on an unfolded header folds the round and stays on it, through ticks too.
+            await pilot.press('up', 'enter')
+            await pilot.pause()
+            await app.tick()
+            self.assertEqual(app.rows, [1, 2, 'Q4', 'Q5'])
+            self.assertEqual((listing.highlighted, app.q['id']), (0, 'Q1'))
+            # A click on the header unfolds it the same way.
+            await pilot.click('#question-list', offset=(4, 0))
+            await pilot.pause()
+            self.assertEqual(app.rows, [1, 'Q1', 'Q2', 'Q3', 2, 'Q4', 'Q5'])
+            self.assertEqual(listing.highlighted, 1)
 
     async def test_sent_question_is_history_but_its_chat_goes_on(self):
         test_grill_ui.answer_all(self.store)
@@ -424,8 +480,8 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.q['id'], 'Q4')
             listing = app.query_one('#question-list', OptionList)
             listing.focus()
-            listing.highlighted = 1
-            await pilot.press('enter')
+            listing.highlighted = 0
+            await pilot.press('enter')  # Unfold round 1: its first question shows.
             await pilot.pause()
             self.assertEqual(app.q['id'], 'Q1')
             self.assertIn('Раунд 1 · отправлен', str(app.query_one('#question-meta').render()))
@@ -466,7 +522,12 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('Нужны теги', str(app.query_one('#reopen-note').render()))
             self.assertIn('пересмотр 1', str(app.query_one('#progress').render()))
             listing = app.query_one('#question-list', OptionList)
+            # Round 1 is folded under round 2, but its header shows the request.
+            self.assertIn('Раунд 1 · отправлен ↺', plain(listing.get_option_at_index(0).prompt))
+            app.unfolded.add(1)
+            app.refresh_list()
             self.assertTrue(plain(listing.get_option_at_index(2).prompt).startswith('↺ 2.'))
+            self.assertNotIn('↺', plain(listing.get_option_at_index(0).prompt))
             # Cancellable until it is sent.
             await pilot.click('#reopen-cancel')
             await pilot.pause()

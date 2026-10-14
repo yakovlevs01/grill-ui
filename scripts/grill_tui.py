@@ -22,7 +22,6 @@ from textual.css.query import NoMatches
 from textual.message import Message
 from textual.strip import Strip
 from textual.widgets import Button, Footer, Input, Label, OptionList, Select, Static, TextArea
-from textual.widgets.option_list import Option
 from grill_client import Client
 from grill_harness import HARNESSES, label
 from grill_ui import open_round, read, write
@@ -77,6 +76,23 @@ class Composer(TextArea):
         await super()._on_key(event)
 
 
+class AnswerField(Composer):
+    """The owner's answer; ← at the very start of the text goes back to the question list."""
+
+    async def _on_key(self, event):
+        if event.key == 'left' and self.selection.is_empty and self.cursor_at_start_of_text:
+            event.stop()
+            event.prevent_default()
+            await self.run_action('app.to_list')
+            return
+        await super()._on_key(event)
+
+
+class QuestionList(OptionList):
+    """The left column: ↑↓ show the question under the cursor, → goes to its answer."""
+    BINDINGS = [Binding('right', 'app.to_question', show=False)]
+
+
 class ChoiceRow:
     """An option row; a recommended one gets an amber stripe along its right edge.
 
@@ -98,8 +114,10 @@ class ChoiceRow:
 class ChoiceList(OptionList):
     """Options with the description under the label; SelectionList shows one line only."""
     # Space toggles. Enter marks the highlighted option; Enter on a marked one confirms the answer.
+    # ← goes back to the question list, the column on the left.
     BINDINGS = [Binding('space', 'select', 'Выбрать', show=False),
-                Binding('enter', 'submit', 'Подтвердить', show=False)]
+                Binding('enter', 'submit', 'Подтвердить', show=False),
+                Binding('left', 'app.to_list', show=False)]
 
     class Toggled(Message):
         def __init__(self, choices):
@@ -367,8 +385,6 @@ class GrillApp(App):
     #question-list > .option-list--option-highlighted { background: ansi_default; color: $strong; text-style: bold; }
     #question-list:focus > .option-list--option-highlighted { background: ansi_default; color: $accent; }
     #question-list > .option-list--option-hover { background: ansi_default; color: $strong; }
-
-    #question-list > .option-list--option-disabled { color: $muted; }
     #center { width: 1fr; padding: 1 3 0 3; }
     #question-view { height: 1fr; }
     #waiting { height: auto; max-width: 96; padding: 0 2; border-left: outer $accent; }
@@ -460,8 +476,10 @@ class GrillApp(App):
         self.state = None
         # The shown question; None is the waiting screen between rounds.
         self.qid = None
-        # Question ID per row of the list; '' marks a round header, None the waiting row.
+        # Question ID per row of the list; a round header holds its round number, None marks the waiting row.
         self.rows = []
+        # Round numbers whose questions the list shows; a new round folds the earlier ones.
+        self.unfolded = set()
         self.list_fingerprint = None
         self.listed = None
         self.reopen_editing = False
@@ -493,7 +511,7 @@ class GrillApp(App):
         with Horizontal(id='body'):
             with Vertical(id='questions'):
                 yield Label('Вопросы', classes='caption')
-                yield OptionList(id='question-list')
+                yield QuestionList(id='question-list')
             with Vertical(id='center'):
                 yield Static('', id='waiting')
                 with Vertical(id='question-view'):
@@ -503,12 +521,12 @@ class GrillApp(App):
                         yield Static('', id='question-body', markup=False)
                         yield Static('', id='recommendation')
                         yield ChoiceList(id='choices')
-                        yield Static('↑↓ Enter выбрать · Enter ещё раз подтвердить · Space снять',
+                        yield Static('↑↓ Enter выбрать · Enter ещё раз подтвердить · Space снять · ← к списку',
                                      id='choices-hint', classes='hint')
                     with Horizontal(id='answer-head', classes='field-head'):
                         yield Label('Ваш ответ', classes='caption')
                         yield Static('Enter сохранить · Shift+Enter перенос', id='answer-hint', classes='hint')
-                    yield Composer(id='answer', soft_wrap=True, tab_behavior='focus')
+                    yield AnswerField(id='answer', soft_wrap=True, tab_behavior='focus')
                     with Horizontal(id='answer-actions'):
                         yield Static('', id='answer-state')
                         yield Button('Подтвердить ответ', id='confirm', variant='primary', compact=True)
@@ -574,8 +592,11 @@ class GrillApp(App):
         # Start where the answer goes, never on a button that Enter would press.
         if self.qid is None:
             return
-        choices = self.query_one('#choices', ChoiceList)
-        (choices if choices.display and not choices.disabled else self.query_one('#answer')).focus()
+        choices, answer = self.query_one('#choices', ChoiceList), self.query_one('#answer')
+        if choices.display and not choices.disabled:
+            choices.focus()
+        elif answer.display:
+            answer.focus()  # A sent answer given only by choice has nothing to focus.
 
     def show_heading(self):
         self.query_one('#heading', Static).update(Text.assemble(
@@ -595,6 +616,7 @@ class GrillApp(App):
                     if qid in self.state['branches']:
                         self.state['branches'][qid]['input_draft'] = draft
                         self.draft_dirty.add(qid)
+            self.unfolded = {len(self.state['rounds'])}
             self.start_view()
             self.show_heading()
             self.refresh_list()
@@ -627,7 +649,7 @@ class GrillApp(App):
             'drafts': {k: self.state['branches'][k].get('input_draft', '') for k in self.draft_dirty}})
 
     def refresh_list(self):
-        """All rounds of the grill; a round header is a row that cannot be selected."""
+        """All rounds of the grill; Enter or a click on a round header folds its questions."""
         numbers, sent, reopen = self.state['numbers'], self.state['submitted_rounds'], self.state['reopen']
         current = open_round(self.state)
         waiting = current is None and not self.state['finished']
@@ -644,8 +666,8 @@ class GrillApp(App):
                 else:
                     marks[q['id']] = ('○', PALETTE['faint'])
         # The list is rebuilt only when it changes, so the scroll position and hover survive ticks.
-        fingerprint = json.dumps([[d['id'] for d in self.state['rounds']], sent, marks, waiting],
-                                 ensure_ascii=False)
+        fingerprint = json.dumps([[d['id'] for d in self.state['rounds']], sent, marks, waiting,
+                                  sorted(self.unfolded)], ensure_ascii=False)
         listing = self.query_one('#question-list', OptionList)
         rebuilt = fingerprint != self.list_fingerprint
         if rebuilt:
@@ -655,9 +677,15 @@ class GrillApp(App):
                 listing.clear_options()
                 for n, doc in enumerate(self.state['rounds'], 1):
                     state = ('отправлен', PALETTE['faint']) if doc['id'] in sent else ('текущий', PALETTE['accent'])
-                    listing.add_option(Option(Text.assemble('\n' if n > 1 else '', (f'Раунд {n}', 'bold'),
-                                                            (' · ', PALETTE['faint']), state), disabled=True))
-                    self.rows.append('')
+                    unfolded = n in self.unfolded
+                    # A folded round still shows that a reopen request waits inside it.
+                    asked = not unfolded and any(q['id'] in reopen for q in doc['questions'])
+                    listing.add_option(Text.assemble('\n' if n > 1 else '', ('▾ ' if unfolded else '▸ ', PALETTE['faint']),
+                                                     (f'Раунд {n}', 'bold'), (' · ', PALETTE['faint']), state,
+                                                     (' ↺', PALETTE['warn']) if asked else ''))
+                    self.rows.append(n)
+                    if not unfolded:
+                        continue
                     for q in doc['questions']:
                         # A grid keeps wrapped titles aligned under the first line.
                         row = Table.grid(padding=(0, 1))
@@ -671,9 +699,11 @@ class GrillApp(App):
                     listing.add_option(Text.assemble('\n', ('…', PALETTE['accent']), ' ',
                                                      ('Агент готовит раунд', PALETTE['muted'])))
                     self.rows.append(None)
-        # The cursor follows the shown question, but a tick never pulls it away from the owner's arrows.
-        if self.qid in self.rows and (rebuilt or self.qid != self.listed):
-            listing.highlighted = self.rows.index(self.qid)
+        # The cursor follows the shown question, or the header of its folded round,
+        # but a tick never pulls it away from the owner's arrows.
+        row = self.qid if self.qid is None or self.qid in self.rows else self.locate(self.qid)[0]
+        if row in self.rows and (rebuilt or self.qid != self.listed):
+            listing.highlighted = self.rows.index(row)
             self.listed = self.qid
         if current:
             ids = [q['id'] for q in current['questions']]
@@ -862,6 +892,7 @@ class GrillApp(App):
         if added:
             # The agent added the next round to this tab: go to its first question.
             self.submit_notice = None
+            self.unfolded = {len(self.state['rounds'])}
             self.start_view()
             self.show_heading()
             self.show_question(self.qid)
@@ -928,7 +959,7 @@ class GrillApp(App):
     @on(Composer.Submitted)
     async def composer_submitted(self, event):
         if event.composer.id == 'answer':
-            await self.confirm_and_advance()
+            await self.action_confirm(quiet=True)
         elif event.composer.id == 'reopen-reason':
             await self.request_reopen()
         else:
@@ -936,18 +967,10 @@ class GrillApp(App):
 
     @on(ChoiceList.Submitted)
     async def choices_submitted(self, event):
-        await self.confirm_and_advance()
+        await self.action_confirm(quiet=True)
 
-    async def confirm_and_advance(self):
-        """Enter: confirm a non-empty answer and move to the next unconfirmed question of the open round."""
-        if not self.state or self.qid is None or not self.is_open(self.qid):
-            return
-        answer = self.state['answers'][self.qid]
-        if not answer['selected'] and not answer['text'].strip():
-            return  # Nothing chosen or written: Enter does nothing.
-        await self.action_confirm()
-        if not self.state['answers'][self.qid]['confirmed']:
-            return
+    def advance(self):
+        """Go to the next unconfirmed question of the open round, or to the submit button."""
         questions = open_round(self.state)['questions']
         index = next(i for i, q in enumerate(questions) if q['id'] == self.qid)
         order = questions[index + 1:] + questions[:index]
@@ -959,12 +982,20 @@ class GrillApp(App):
         self.show_question(pending['id'])
         self.focus_answer()
 
-    def show_question(self, qid):
+    def show_question(self, qid, keep_view=False):
         self.qid = qid
         self.load_question()
         self.refresh_list()
-        self.compact_view = 'center'
+        if not keep_view:
+            self.compact_view = 'center'
         self.apply_layout()
+
+    async def open_question(self, qid, keep_view=False):
+        try:
+            await self.flush()
+        except (OSError, ValueError) as exc:
+            self.status(f'Черновик сохранён локально: {exc}', error=True)
+        self.show_question(qid, keep_view)
 
     @on(ChoiceList.Toggled)
     def selected(self, event):
@@ -979,31 +1010,51 @@ class GrillApp(App):
 
     @on(OptionList.OptionSelected, '#question-list')
     async def question_selected(self, event):
-        if not self.state or self.rows[event.option_index] == '':
+        """Enter or a click: a round header folds or unfolds, a question goes to its answer."""
+        if not self.state:
             return
-        try:
-            await self.flush()
-        except (OSError, ValueError) as exc:
-            self.status(f'Черновик сохранён локально: {exc}', error=True)
-        self.show_question(self.rows[event.option_index])
+        row = self.rows[event.option_index]
+        if isinstance(row, int):
+            self.unfolded ^= {row}
+            self.refresh_list()
+            # An unfolded round lands on its first question, right under the header; a folded one stays on it.
+            header = self.rows.index(row)
+            event.option_list.highlighted = header + 1 if row in self.unfolded else header
+            return
+        if row != self.qid:
+            await self.open_question(row)
+        self.action_to_question()
 
-    async def action_confirm(self):
+    @on(OptionList.OptionHighlighted, '#question-list')
+    async def question_highlighted(self, event):
+        """↑↓ in the list show the question under the cursor; the list keeps the focus."""
+        if not self.state or not event.option_list.has_focus:
+            return  # A tick moved the cursor to the shown question itself.
+        row = self.rows[event.option_index]
+        if not isinstance(row, int) and row != self.qid:  # A round header shows nothing.
+            await self.open_question(row, keep_view=True)
+
+    async def action_confirm(self, quiet=False):
+        """The button, Ctrl+S and Enter: confirm a non-empty answer and move on."""
         if not self.state or self.qid is None or not self.is_open(self.qid):
             return
         answer = self.state['answers'][self.q['id']]
         if not answer['selected'] and not answer['text'].strip():
-            self.status('Выберите вариант или напишите ответ.')
+            if not quiet:  # Enter on an empty answer does nothing; a tick would overwrite the status line.
+                self.notify('Выберите вариант или напишите ответ.', timeout=4)
             return
         answer['confirmed'] = True
         self.dirty.add(self.q['id'])
         self.checkpoint()
         try:
             await self.flush()
-            self.refresh_list()
-            self.refresh_controls()
-            self.status('Ответ подтверждён. Перейдите к следующему вопросу.')
+            self.status('Ответ подтверждён.')
         except (OSError, ValueError) as exc:
+            # The confirmation waits in tui-pending.json; the owner goes on answering.
             self.status(f'Подтверждение пока не сохранено на сервере: {exc}', error=True)
+        self.refresh_list()
+        self.refresh_controls()
+        self.advance()
 
     async def request_reopen(self):
         """Save the owner's reason; the request goes to the agent with the next submit."""
@@ -1168,6 +1219,21 @@ class GrillApp(App):
         self.hide_discussion = False
         self.apply_layout()
         self.query_one('#message').focus()
+
+    def action_to_list(self):
+        """←: from the shown question to the list, the column on the left."""
+        self.compact_view = 'questions'
+        self.hide_questions = False
+        self.apply_layout()
+        self.query_one('#question-list').focus()
+
+    def action_to_question(self):
+        """→: from the list back to the answer of the shown question."""
+        if self.qid is None:
+            return
+        self.compact_view = 'center'
+        self.apply_layout()
+        self.focus_answer()
 
     def action_questions(self):
         self.compact_view = 'center' if self.compact_view == 'questions' else 'questions'
