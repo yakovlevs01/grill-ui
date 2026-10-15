@@ -338,6 +338,67 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                         self.assertIn(g.read(self.fixture.root/'status.json')['result_file'], app.submit_notice)
                     self.assertIs(app.focused, app.query_one('#return', Button))
 
+    async def test_phone_width_bar_answers_the_round_by_taps(self):
+        app = GrillApp(self.fixture.root, self.api)
+        # A phone in a web terminal: about 50 columns, no F-keys.
+        async with app.run_test(size=(50, 50)) as pilot:
+            await pilot.pause()
+            bar = lambda ident: app.query_one('#' + ident, Button)
+            self.assertTrue(app.query_one('#phone-bar').display)
+            self.assertFalse(app.query_one('Footer').display)
+            self.assertFalse(app.query_one('#answer-hint').display)
+            self.assertFalse(app.query_one('#confirm').display)
+            self.assertEqual(str(bar('bar-action').label), 'Подтвердить ›')
+            # Finger targets: three rows tall, framed.
+            self.assertEqual(bar('bar-action').outer_size.height, 3)
+            # An empty answer stays put and says why, as the confirm button does.
+            await pilot.click('#bar-action')
+            await pilot.pause()
+            self.assertEqual(app.q['id'], 'Q1')
+            self.assertTrue(any('Выберите вариант' in str(n.message) for n in app._notifications))
+            await pilot.click('#choices', offset=(3, 0))
+            await pilot.click('#bar-action')
+            await pilot.pause()
+            self.assertTrue(self.store.state['answers']['Q1']['confirmed'])
+            self.assertEqual(app.q['id'], 'Q2')
+            # The list and the chat open from the bar; the same button goes back.
+            await pilot.click('#bar-questions')
+            await pilot.pause()
+            self.assertTrue(app.query_one('#questions').display)
+            self.assertFalse(bar('bar-action').visible)
+            self.assertEqual(str(bar('bar-questions').label), '‹ Назад')
+            await pilot.click('#bar-questions')
+            await pilot.pause()
+            self.assertTrue(app.query_one('#center').display)
+            places = [bar(i).region for i in ('bar-questions', 'bar-chat')]
+            await pilot.click('#bar-chat')
+            await pilot.pause()
+            self.assertTrue(app.query_one('#discussion').display)
+            # No confirm here, yet the buttons stay where the thumb left them.
+            self.assertEqual([bar(i).region for i in ('bar-questions', 'bar-chat')], places)
+            self.assertIs(app.focused, app.query_one('#message'))
+            await pilot.click('#bar-chat')
+            await pilot.pause()
+            self.assertTrue(app.query_one('#center').display)
+            for qid, text in (('Q2', 'Название'), ('Q3', 'Три статьи')):
+                self.assertEqual(app.q['id'], qid)
+                app.query_one('#answer', TextArea).load_text(text)
+                await pilot.pause()
+                await pilot.click('#bar-action')
+                await pilot.pause()
+            # Every answer confirmed: the same place sends the round.
+            self.assertEqual(str(bar('bar-action').label), 'Отправить все ответы')
+            await pilot.click('#bar-action')
+            await pilot.pause()
+            self.assertEqual(len(g.read(g.read(self.fixture.root/'status.json')['result_file'])['answers']), 3)
+            self.assertFalse(bar('bar-action').visible)
+            self.assertFalse(bar('bar-chat').display)
+            # Back on a wide screen nothing of the phone stays.
+            await pilot.resize_terminal(150, 45)
+            await pilot.pause()
+            self.assertFalse(app.query_one('#phone-bar').display)
+            self.assertTrue(app.query_one('Footer').display)
+
     async def test_offline_recovery_switching_and_narrow_layout(self):
         app = GrillApp(self.fixture.root, self.api)
         async with app.run_test(size=(85, 32)) as pilot:

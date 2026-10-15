@@ -40,6 +40,9 @@ ALL_CONFIRMED = 'Все ответы подтверждены. Нажмите «
 AGENT_NOTIFIED = 'Отправлено, агент получил «Готово» и путь к новому файлу: {path}'
 WAITING = 'Агент готовит следующий раунд. Прошлые вопросы и их чаты доступны в списке.'
 FINISHED = 'Grill завершён. Ответы и чаты только для чтения.'
+# Below this width one column shows at a time and the controls are sized for a finger:
+# a phone through a web terminal lands here, with no F-keys and a cell about 13px tall.
+NARROW = 110
 
 
 class CellMouseDriver(LinuxDriver):
@@ -463,6 +466,19 @@ class GrillApp(App):
     .narrow #center, .narrow #discussion { width: 100%; }
     .narrow #questions, .narrow #discussion { border: none; }
     .narrow #center { padding: 1 1 0 1; }
+    /* A finger needs about three rows: buttons get a frame and the rows that hold them grow. */
+    .narrow Footer { display: none; }
+    .narrow #reopen-buttons, .narrow #chat-buttons, .narrow #draft-buttons { height: 3; }
+    /* Its button is on the bar while the question is open; the row grows only for «Пересмотреть». */
+    .narrow #answer-actions { height: auto; }
+    /* The bar sits below the status, so a wrapped status moves nothing under the thumb. */
+    .narrow #status { height: auto; max-height: 3; }
+    .narrow #body Button, #phone-bar Button { height: 3; padding: 0 1; border: round $line-strong; }
+    .narrow #body Button:focus, #phone-bar Button:focus { border: round $accent; }
+    .narrow #body Button:disabled, #phone-bar Button:disabled { border: round $line; }
+    #phone-bar { height: 3; padding: 0 1; }
+    #phone-bar Button { width: 1fr; margin-right: 1; }
+    #phone-bar #bar-action { width: 2fr; margin-right: 0; }
     '''
 
     def get_css_variables(self):
@@ -495,6 +511,8 @@ class GrillApp(App):
         # Wide-screen panels the owner hid with F2 / F7; they stay hidden across redraws.
         self.hide_questions = False
         self.hide_discussion = False
+        # What the narrow screen's bar button does now: 'confirm', 'submit' or nothing.
+        self.bar_role = None
         self.pending_file = self.session / 'tui-pending.json'
         self.submit_notice = None
         self.catalog = {'ready': False, 'harnesses': {}}
@@ -504,8 +522,6 @@ class GrillApp(App):
         with Horizontal(id='header'):
             yield Static('Grill', id='heading')
             yield Static('', id='progress')
-            yield Button('Вопросы', id='toggle-questions', compact=True)
-            yield Button('Вопрос / чат', id='toggle-chat', compact=True)
             yield Button('К агенту', id='return', compact=True)
             yield Button('Отправить все ответы', id='submit', variant='success', compact=True)
         with Horizontal(id='body'):
@@ -546,7 +562,7 @@ class GrillApp(App):
                 yield Static('', id='chat-status', markup=False)
                 with Horizontal(classes='field-head'):
                     yield Label('Сообщение', classes='caption')
-                    yield Static('Enter отправить · Shift+Enter перенос', classes='hint')
+                    yield Static('Enter отправить · Shift+Enter перенос', id='message-hint', classes='hint')
                 yield Composer(id='message', soft_wrap=True, tab_behavior='focus')
                 with Horizontal(id='chat-buttons'):
                     yield Button('Отправить', id='send', variant='primary', compact=True)
@@ -556,6 +572,11 @@ class GrillApp(App):
                 with Horizontal(id='draft-buttons'):
                     yield Button('Вставить в мой ответ', id='insert', compact=True)
         yield Static('Подключение…', id='status', markup=False)
+        # Narrow screens only: the columns and the next step, at the bottom edge within a thumb's reach.
+        with Horizontal(id='phone-bar'):
+            yield Button('Вопросы', id='bar-questions')
+            yield Button('Чат', id='bar-chat')
+            yield Button('', id='bar-action', variant='primary')
         yield Footer()
 
     async def api(self, path, data=None):
@@ -747,8 +768,6 @@ class GrillApp(App):
             choices.display = q.get('mode') != 'text' and bool(q.get('options'))
             # A sent answer stays visible as history; only a new round asks again.
             choices.disabled = not live
-            self.query_one('#choices-hint').display = choices.display and live
-            self.query_one('#answer-hint').display = live
             editor = self.query_one('#answer', TextArea)
             editor.read_only = not live
             editor.load_text(answer['text'])
@@ -772,10 +791,16 @@ class GrillApp(App):
         submit.label = 'Отправить все ответы' if current or not reopen else 'Отправить пересмотр'
         submit.disabled = finished or not (current or reopen)
         self.query_one('#return', Button).variant = 'success' if current is None else 'default'
+        self.refresh_bar()
         if self.qid is None:
             return
         qid = self.qid
         live = self.is_open(qid)
+        # Key hints are no use on a phone: it has no F-keys or Shift+Enter, and the bar does the confirming.
+        narrow = self.size.width < NARROW
+        self.query_one('#choices-hint').display = self.query_one('#choices').display and live and not narrow
+        self.query_one('#answer-hint').display = live and not narrow
+        self.query_one('#message-hint').display = not narrow
         running = self.state['branches'][qid]['status'] == 'running'
         # Chats of sent questions go on; they close only when the grill is finished.
         self.query_one('#message').disabled = finished
@@ -786,7 +811,7 @@ class GrillApp(App):
         answer = self.state['answers'][qid]
         confirmed = answer['confirmed']
         confirm = self.query_one('#confirm', Button)
-        confirm.display = live
+        confirm.display = live and not narrow
         confirm.label = 'Подтверждено ✓' if confirmed else 'Подтвердить ответ'
         pending = reopen.get(qid)
         self.query_one('#reopen').display = not live and not pending and not self.reopen_editing
@@ -808,6 +833,44 @@ class GrillApp(App):
         else:
             state.update('Ответ подтверждён' if confirmed else
                          'Черновик, не подтверждён' if answer['selected'] or answer['text'].strip() else 'Ответа пока нет')
+
+    def refresh_bar(self):
+        """The narrow screen's bar: the other columns, and the next step of the grill."""
+        narrow = self.size.width < NARROW
+        self.query_one('#phone-bar').display = narrow
+        if not narrow:
+            return
+        view = self.compact_view
+        self.query_one('#bar-questions', Button).label = '‹ Назад' if view == 'questions' else 'Вопросы'
+        chat = self.query_one('#bar-chat', Button)
+        chat.label = '‹ Назад' if view == 'discussion' else 'Чат'
+        chat.display = self.qid is not None  # The waiting screen has no question to discuss.
+        current = open_round(self.state)
+        self.bar_role, text = None, ''
+        if self.state['finished']:
+            pass
+        elif current and all(self.state['answers'][q['id']]['confirmed'] for q in current['questions']):
+            self.bar_role, text = 'submit', 'Отправить все ответы'
+        elif not current and self.state['reopen']:
+            self.bar_role, text = 'submit', 'Отправить пересмотр'
+        elif view == 'center' and self.qid is not None and self.is_open(self.qid):
+            confirmed = self.state['answers'][self.qid]['confirmed']
+            self.bar_role, text = 'confirm', 'Подтверждено ✓' if confirmed else 'Подтвердить ›'
+        action = self.query_one('#bar-action', Button)
+        action.label = text
+        # The slot keeps its place: a second tap on the same spot never lands on a shifted button.
+        action.visible = self.bar_role is not None
+        action.disabled = self.bar_role is None
+
+    def bar_switch(self, view):
+        """A bar button opens its column; on that column it goes back to the question."""
+        if self.compact_view != view:
+            (self.action_to_list if view == 'questions' else self.action_message_field)()
+        elif self.qid is None:
+            self.compact_view = 'center'
+            self.apply_layout()
+        else:
+            self.action_to_question()
 
     def chat_runtime(self):
         branch = self.state['branches'][self.q['id']]
@@ -1077,12 +1140,11 @@ class GrillApp(App):
     @on(Button.Pressed)
     async def pressed(self, event):
         ident = event.button.id
-        if ident == 'toggle-questions':
-            self.action_questions()
+        if ident in ('bar-questions', 'bar-chat'):
+            self.bar_switch('questions' if ident == 'bar-questions' else 'discussion')
             return
-        if ident == 'toggle-chat':
-            self.action_discussion()
-            return
+        if ident == 'bar-action':
+            ident = self.bar_role  # Confirms or sends, exactly as its own button does.
         if ident == 'agent':
             await self.action_agent()
             return
@@ -1260,11 +1322,11 @@ class GrillApp(App):
             self.call_after_refresh(self.apply_layout)
 
     def apply_layout(self):
-        narrow = self.size.width < 110
+        narrow = self.size.width < NARROW
         self.set_class(narrow, 'narrow')
-        # Wide screens show every column; the view toggles only matter when narrow.
-        for ident in ('toggle-questions', 'toggle-chat'):
-            self.query_one('#' + ident).display = narrow
+        # Textual's compact style drops the frame that makes a narrow-screen button a finger target.
+        for button in self.query('#body Button'):
+            button.compact = not narrow
         # The waiting screen has no question, so there is no chat to show beside it.
         waiting = self.state is not None and self.qid is None
         view = 'center' if waiting and self.compact_view == 'discussion' else self.compact_view
@@ -1274,6 +1336,8 @@ class GrillApp(App):
             self.query_one('#' + name).display = name == view if narrow else (
                 name == 'discussion' if expanded else not hidden[name])
         self.query_one('#discussion').styles.width = '100%' if expanded or narrow else '34%'
+        if self.state:
+            self.refresh_controls()  # The bar and the key hints follow the width and the shown column.
 
     async def action_leave(self):
         if self.state:
