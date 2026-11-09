@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Install, open, wait for and finish the Grill tab of one grill on the agent's Herdr server."""
+"""Install, open, wait for and finish the Grill tab of one grill on the agent's Herdr server.
+
+Two backends: the Herdr app, whose terminals run in herdr-core (`hc`, HC_TERMINAL_ID), and the
+older Herdr multiplexer (`herdr`, HERDR_ENV=1). herdr.json records which one owns the grill."""
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
 import os
+import secrets
 from pathlib import Path
 import shlex
 import shutil
@@ -25,6 +30,192 @@ CONTEXT_KEYS = ('HERDR_SOCKET_PATH', 'HERDR_SESSION', 'HERDR_CONFIG_PATH',
                 'HERDR_BIN_PATH', 'HERDR_WORKSPACE_ID', 'HERDR_TAB_ID', 'HERDR_PANE_ID')
 SUBMIT_NOTICE = 'Готово: ответы Grill отправлены'
 REOPEN_NOTICE = 'Готово: запрос на пересмотр Grill отправлен'
+TUI_START = 20
+
+
+def is_hc(owner):
+    return owner.get('backend') == 'hc'
+
+
+def tui_command(session):
+    return [str(PYTHON), str(ROOT / 'scripts/grill_tui.py'), '--session', str(session)]
+
+
+def runs_this_tui(argv, session):
+    return str(ROOT / 'scripts/grill_tui.py') in argv and str(session) in argv
+
+
+# --- Herdr app: terminals live in herdr-core; the window adopts them by their labels. ---
+
+def hc(args, env=None):
+    env = dict(os.environ if env is None else env)
+    binary = env.get('GRILL_HC') or shutil.which('hc', path=env.get('PATH')) \
+        or shutil.which('hc', path=str(Path.home() / '.local/bin'))
+    require(binary, 'hc (herdr-core) is not installed')
+    # --json goes before any `--`: after it, it would become the program's argument.
+    result = subprocess.run([binary, args[0], '--json', *args[1:]], env=env, capture_output=True, text=True, timeout=30)
+    try:
+        data = json.loads(result.stdout or result.stderr)
+    except json.JSONDecodeError:
+        data = {'error': {'message': result.stderr.strip() or result.stdout.strip() or 'hc failed'}}
+    if result.returncode != 0 or (isinstance(data, dict) and 'error' in data):
+        error = data.get('error') if isinstance(data, dict) else None
+        message = error.get('message') if isinstance(error, dict) else error
+        raise ValueError(f'hc {args[0]}: {message or "failed"}')
+    return data
+
+
+def hc_terminal(address, env):
+    """The terminal, or None once it is gone or finished."""
+    try:
+        info = hc(['get', address], env)
+    except ValueError as exc:
+        if 'no terminal' in str(exc):
+            return None
+        raise
+    return info if info.get('state') == 'live' else None
+
+
+def window(args, env):
+    """Change what the Herdr window shows. Only the machine with the window has herdr-app;
+    on a remote machine the tab still appears, unnamed and unfocused."""
+    binary = shutil.which('herdr-app', path=env.get('PATH'))
+    if not binary:
+        return False
+    result = subprocess.run([binary, *args], env=env, capture_output=True, text=True, timeout=15)
+    return result.returncode == 0 and '"error"' not in result.stdout
+
+
+def show_tab(space, tab, env):
+    return window(['do', 'space.select', '--id', space], env) and window(['do', 'tab.select', '--id', tab], env)
+
+
+def hc_context():
+    address = os.environ['HC_TERMINAL_ID']
+    me = hc(['get', address])
+    labels = me.get('labels', {})
+    require(labels.get('herdr.space') and labels.get('herdr.tab'),
+            'This terminal is not in a Herdr app space; run the agent in a Herdr tab')
+    endpoint = os.environ.get('HC_TERMINAL_SOCKET')
+    return {'backend': 'hc', 'host': socket.gethostname(),
+            'socket': str(Path(endpoint).resolve()) if endpoint else 'hc',
+            'env': {k: os.environ[k] for k in ('HC_TERMINAL_SOCKET',) if k in os.environ},
+            'hc': shutil.which('hc') or '', 'workspace': labels['herdr.space'],
+            'parent_tab': labels['herdr.tab'], 'parent_terminal': address,
+            'parent_created': me['created_ms']}
+
+
+def hc_env(owner):
+    require(owner['host'] == socket.gethostname(), 'This round belongs to another host')
+    # The TUI's own terminal sets HC_TERMINAL_ID; hc then signs messages as the Grill tab.
+    env = dict(os.environ)
+    env.update(owner['env'])
+    if owner.get('hc'):
+        env['GRILL_HC'] = owner['hc']
+    return env
+
+
+def hc_owned(owner, env):
+    """The live Grill terminal. Its tab label is a random ID only this grill wrote, so a reused
+    address cannot pass; a core restart keeps the address and labels and puts a shell in place."""
+    if not owner.get('terminal'):
+        return None
+    info = hc_terminal(owner['terminal'], env)
+    if not info:
+        return None
+    require(info.get('labels', {}).get('herdr.tab') == owner.get('tab'),
+            'Grill terminal changed; refusing to close or replace it')
+    return info
+
+
+def hc_idle(info):
+    """A core restart replaces the lost TUI with a shell in place; nothing else may run there."""
+    foreground = info.get('foreground') or {}
+    return foreground.get('pid') in (None, info.get('pid'))
+
+
+def hc_drop(owner, env):
+    address = owner['terminal']
+    hc(['kill', address], env)
+    for _ in range(50):
+        if not hc_terminal(address, env):
+            break
+        time.sleep(.1)
+    with contextlib.suppress(ValueError):
+        hc(['rm', address], env)
+
+
+def hc_start(owner, env, session, cwd):
+    """Run the TUI as the program of a new terminal labelled for a new tab of the agent's space."""
+    owner['tab'] = 'tb' + secrets.token_hex(16)
+    created = hc(['run', '--bg', '--no-parent', '--no-notify', '--cwd', cwd,
+                  '--label', 'herdr.space=' + owner['workspace'], '--label', 'herdr.tab=' + owner['tab'],
+                  '--', *tui_command(session)], env)
+    owner['terminal'] = created['address']
+    write(session / 'herdr.json', owner)
+    deadline = time.monotonic() + TUI_START
+    while time.monotonic() < deadline:
+        if tui_alive(session):
+            # The window adopts the terminal shortly after it starts; only then can it be named.
+            for _ in range(20):
+                if window(['do', 'tab.rename', '--id', owner['tab'], '--name', 'Grill'], env):
+                    break
+                if not shutil.which('herdr-app', path=env.get('PATH')):
+                    break
+                time.sleep(.25)
+            return
+        if not hc_terminal(owner['terminal'], env):
+            raise ValueError(f'Grill TUI exited at start; inspect `hc read {owner["terminal"]}`')
+        time.sleep(.25)
+    hc_drop(owner, env)
+    raise ValueError('Grill TUI did not start within 20 seconds')
+
+
+def hc_open(args, session, caller):
+    path = session / 'herdr.json'
+    owner = read(path) if path.exists() else caller
+    require(is_hc(owner) and owner['host'] == caller['host'] and owner['socket'] == caller['socket']
+            and owner['workspace'] == caller['workspace'],
+            'Grill belongs to a different Herdr server/space')
+    require(not owner.get('finished'), 'This grill is finished; start a new one')
+    env = hc_env(owner)
+    ensure_server(session)
+    info = hc_owned(owner, env)
+    if info and not tui_alive(session):
+        require(hc_idle(info), 'Grill tab contains another foreground process; refusing to replace it')
+        hc_drop(owner, env)
+        info = None
+    reused = bool(info)
+    if not reused:
+        if owner.get('terminal'):
+            # The owner closed the tab: its finished terminal is no longer needed.
+            with contextlib.suppress(ValueError):
+                hc(['rm', owner['terminal']], env)
+        hc_start(owner, env, session, read(session / 'state.json')['cwd'])
+    focused = show_tab(owner['workspace'], owner['tab'], env) if args.focus else False
+    registry = DATA / 'active' / (registry_key(owner) + '.json')
+    write(registry, {'session': str(session)})
+    print(json.dumps({'tab': owner['tab'], 'terminal': owner['terminal'], 'workspace': owner['workspace'],
+                      'host': owner['host'], 'session': str(session), 'reused': reused,
+                      'focused': focused}, ensure_ascii=False))
+
+
+def hc_close(owner, session):
+    env = hc_env(owner)
+    info = hc_owned(owner, env)
+    if info:
+        require(tui_alive(session) or hc_idle(info), 'Another process occupies the Grill tab; refusing to close it')
+        hc_drop(owner, env)
+    elif owner.get('terminal'):
+        with contextlib.suppress(ValueError):
+            hc(['rm', owner['terminal']], env)
+
+
+def hc_agent(owner):
+    env = hc_env(owner)
+    info = hc_terminal(owner['parent_terminal'], env)
+    require(info and info.get('created_ms') == owner['parent_created'], 'Original agent terminal is gone')
+    return info, env
 
 
 def herdr_binary(env):
@@ -48,6 +239,10 @@ def herdr(args, env=None):
 
 
 def context():
+    # An old Herdr started inside a Herdr app terminal passes HC_TERMINAL_ID to its panes:
+    # HERDR_ENV marks the innermost multiplexer.
+    if os.environ.get('HERDR_ENV') != '1' and os.environ.get('HC_TERMINAL_ID'):
+        return hc_context()
     require(os.environ.get('HERDR_ENV') == '1', 'Run inside the agent’s Herdr pane')
     require(os.environ.get('HERDR_SOCKET_PATH'), 'Missing Herdr server socket')
     pane = herdr(['pane', 'current', '--current'])['pane']
@@ -87,8 +282,7 @@ def tui_alive(session):
 
 
 def runs_tui(info, session):
-    return any(str(ROOT / 'scripts/grill_tui.py') in p.get('argv', []) and str(session) in p.get('argv', [])
-               for p in info.get('foreground_processes', []))
+    return any(runs_this_tui(p.get('argv', []), session) for p in info.get('foreground_processes', []))
 
 
 def rebind(session, owner, env, identity):
@@ -158,10 +352,10 @@ def owned_pane(owner, env):
 
 def run_tui(owner, env, session):
     """Type the TUI command into the Grill pane and wait until the TUI holds its lock."""
-    command = shlex.join([str(PYTHON), str(ROOT / 'scripts/grill_tui.py'), '--session', str(session)])
+    command = shlex.join(tui_command(session))
     herdr(['pane', 'run', owner['pane'], command], env)
     retried = False
-    deadline = time.monotonic() + 20
+    deadline = time.monotonic() + TUI_START
     while time.monotonic() < deadline:
         time.sleep(.25)
         if tui_alive(session):
@@ -184,6 +378,9 @@ def open_tab(args):
     subprocess.run([str(PYTHON), '-c', 'import textual'], check=True, capture_output=True)
     caller = context()
     with locked(session):
+        if is_hc(caller):
+            hc_open(args, session, caller)
+            return
         path = session / 'herdr.json'
         owner = read(path) if path.exists() else caller
         require(owner['host'] == caller['host'] and owner['socket'] == caller['socket']
@@ -240,15 +437,14 @@ def finish(args):
         if owner.get('finished'):
             print(json.dumps({'finished': True, 'already_finished': True}))
             return
-        env = owner_env(owner, session)
-        if tab_present(owner, env):
+        if is_hc(owner):
+            hc_close(owner, session)
+        elif tab_present(owner, env := owner_env(owner, session)):
             owned_pane(owner, env)
             info = herdr(['pane', 'process-info', '--pane', owner['pane']], env)['process_info']
             at_shell = info['foreground_process_group_id'] == info['shell_pid']
             processes = info.get('foreground_processes', [])
-            is_tui = bool(processes) and all(
-                str(ROOT / 'scripts/grill_tui.py') in p.get('argv', [])
-                and str(session) in p.get('argv', []) for p in processes)
+            is_tui = bool(processes) and all(runs_this_tui(p.get('argv', []), session) for p in processes)
             require(at_shell or is_tui, 'Another process occupies the Grill tab; refusing to close it')
             herdr(['tab', 'close', owner['tab']], env)
         client = Client(session)
@@ -276,6 +472,13 @@ def agent_pane(session):
 
 
 def return_to_agent(session):
+    owner = read(Path(session) / 'herdr.json')
+    if is_hc(owner):
+        info, env = hc_agent(owner)
+        labels = info.get('labels', {})
+        require(show_tab(labels.get('herdr.space', owner['workspace']), labels.get('herdr.tab', owner['parent_tab']), env),
+                'switch tabs in the Herdr window by hand: herdr-app is not on this machine')
+        return
     pane, env = agent_pane(session)
     herdr(['tab', 'focus', pane['tab_id']], env)
 
@@ -290,6 +493,12 @@ def submit_notice(session):
 
 def notify_agent(session):
     """Type the submit notice into the agent's input, after any text already there."""
+    owner = read(Path(session) / 'herdr.json')
+    if is_hc(owner):
+        _, env = hc_agent(owner)
+        # hc pastes after what the person typed, waits for a typing pause, then presses Enter.
+        hc(['send', owner['parent_terminal'], submit_notice(session)], env)
+        return
     pane, env = agent_pane(session)
     herdr(['pane', 'send-text', pane['pane_id'], submit_notice(session)], env)
     # A separate Enter keeps agent TUIs from folding it into the text as a pasted newline.

@@ -144,6 +144,152 @@ class OwnershipTests(unittest.TestCase):
             f.tearDown()
 
 
+class HerdrAppTests(unittest.TestCase):
+    """The Herdr app runs terminals in herdr-core; the window adopts them by their labels."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.session = Path(self.tmp.name).resolve()
+        h.write(self.session/'state.json', {'cwd': '/work'})
+        self.owner = {'backend': 'hc', 'host': h.socket.gethostname(), 'socket': '/run/hc.sock',
+                      'env': {'HC_TERMINAL_SOCKET': '/run/hc.sock'}, 'hc': '', 'workspace': 'sp1',
+                      'parent_tab': 'tb1', 'parent_terminal': 't7', 'parent_created': 100}
+        self.tui = ['python', str(h.ROOT/'scripts/grill_tui.py'), '--session', str(self.session)]
+        self.terminals = {'t7': {'state': 'live', 'created_ms': 100, 'pid': 1,
+                                 'labels': {'herdr.space': 'sp1', 'herdr.tab': 'tb1'}}}
+        self.calls, self.shown = [], []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def hc(self, args, env=None):
+        self.calls.append(args)
+        if args[0] == 'get':
+            if args[1] not in self.terminals:
+                raise ValueError(f'hc get: no terminal "{args[1]}"')
+            return self.terminals[args[1]]
+        if args[0] == 'run':
+            tab = next(a.split('=', 1)[1] for a in args if a.startswith('herdr.tab='))
+            self.terminals['t20'] = {'state': 'live', 'pid': 5, 'argv': self.tui,
+                                     'labels': {'herdr.space': 'sp1', 'herdr.tab': tab}}
+            return {'address': 't20'}
+        if args[0] == 'kill':
+            self.terminals[args[1]]['state'] = 'finished'
+        if args[0] == 'rm':
+            self.terminals.pop(args[1], None)
+        return {}
+
+    def window(self, args, env):
+        self.shown.append(args[1:])
+        return True
+
+    @contextlib.contextmanager
+    def patched(self, tui=True):
+        with patch.object(h, 'hc', self.hc), patch.object(h, 'window', self.window), \
+             patch.object(h, 'ensure_server'), patch.object(h, 'tui_alive', lambda s, seen=iter(tui if isinstance(tui, list) else [tui]): next(seen, True)), \
+             patch.object(h, 'DATA', self.session/'data'), patch.object(h.time, 'sleep'), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            yield out
+
+    def open(self, focus=False):
+        h.hc_open(h.argparse.Namespace(focus=focus), self.session, dict(self.owner))
+        return h.read(self.session/'herdr.json')
+
+    def test_herdr_app_terminal_selects_hc_unless_old_herdr_is_inner(self):
+        with patch.dict(h.os.environ, {'HC_TERMINAL_ID': 't7'}, clear=True), \
+             patch.object(h, 'hc_context', return_value='hc'):
+            self.assertEqual(h.context(), 'hc')
+        with patch.dict(h.os.environ, {'HC_TERMINAL_ID': 't7', 'HERDR_ENV': '1'}, clear=True), \
+             patch.object(h, 'hc_context', return_value='hc'), patch.object(h, 'herdr', side_effect=ValueError('old')):
+            with self.assertRaisesRegex(ValueError, 'socket|old'):
+                h.context()
+
+    def test_json_flag_never_lands_in_the_program_argv(self):
+        done = h.subprocess.CompletedProcess([], 0, stdout='{"address": "t3"}', stderr='')
+        with patch.object(h.subprocess, 'run', return_value=done) as run:
+            h.hc(['run', '--bg', '--', 'python', 'tui.py'], {'GRILL_HC': '/bin/hc'})
+        self.assertEqual(run.call_args.args[0], ['/bin/hc', 'run', '--json', '--bg', '--', 'python', 'tui.py'])
+        failed = h.subprocess.CompletedProcess([], 3, stdout='{"error": {"message": "no terminal"}}', stderr='')
+        with patch.object(h.subprocess, 'run', return_value=failed):
+            with self.assertRaisesRegex(ValueError, 'no terminal'):
+                h.hc(['get', 't9'], {'GRILL_HC': '/bin/hc'})
+
+    def test_open_starts_a_labelled_tab_then_reuses_it(self):
+        with self.patched():
+            owner = self.open(focus=True)
+        run = next(c for c in self.calls if c[0] == 'run')
+        self.assertIn('--no-parent', run)
+        self.assertIn('herdr.space=sp1', run)
+        self.assertIn('herdr.tab=' + owner['tab'], run)
+        self.assertEqual(run[run.index('--') + 1:], h.tui_command(self.session))
+        self.assertEqual(owner['terminal'], 't20')
+        self.assertIn(['tab.rename', '--id', owner['tab'], '--name', 'Grill'], self.shown)
+        self.assertEqual(self.shown[-1], ['tab.select', '--id', owner['tab']])
+        self.calls.clear()
+        with self.patched():
+            self.assertEqual(self.open(), owner)
+        self.assertFalse([c for c in self.calls if c[0] in ('run', 'kill')])
+
+    def test_closed_tab_or_recovered_shell_gets_a_new_tab(self):
+        with self.patched():
+            first = self.open()
+        self.terminals['t20']['state'] = 'finished'
+        with self.patched():
+            second = self.open()
+        self.assertNotEqual(second['tab'], first['tab'])
+        self.assertIn(['rm', 't20'], self.calls)
+        # After a core restart a shell sits where the TUI was: replace it.
+        self.terminals['t20']['foreground'] = {'pid': 5, 'argv': ['zsh']}
+        self.calls.clear()
+        # The lock is free until the new TUI takes it.
+        with self.patched(tui=[False]):
+            self.open()
+        self.assertIn(['kill', 't20'], self.calls)
+        # Anything the owner started there is left alone.
+        self.terminals['t20'] = {**self.terminals['t20'], 'state': 'live', 'foreground': {'pid': 9, 'argv': ['vim']}}
+        with self.patched(tui=[False]):
+            with self.assertRaisesRegex(ValueError, 'another foreground process'):
+                self.open()
+
+    def test_foreign_terminal_at_the_recorded_address_is_refused(self):
+        with self.patched():
+            owner = self.open()
+        self.terminals['t20']['labels']['herdr.tab'] = 'tb-other'
+        with self.patched():
+            with self.assertRaisesRegex(ValueError, 'terminal changed'):
+                h.hc_close(owner, self.session)
+        self.assertNotIn(['kill', 't20'], self.calls)
+
+    def test_other_space_is_refused(self):
+        with self.patched():
+            self.open()
+            with self.assertRaisesRegex(ValueError, 'different Herdr'):
+                h.hc_open(h.argparse.Namespace(focus=False), self.session, {**self.owner, 'workspace': 'sp2'})
+
+    def test_notice_goes_to_the_same_agent_terminal(self):
+        h.write(self.session/'herdr.json', self.owner)
+        newest = str(self.session/'submissions/0001.json')
+        h.write(self.session/'status.json', {'submitted': True, 'result_file': newest})
+        h.write(Path(newest), {'round_id': 'r1', 'answers': [], 'reopen': []})
+        with self.patched():
+            h.notify_agent(self.session)
+            h.return_to_agent(self.session)
+        self.assertIn(['send', 't7', h.SUBMIT_NOTICE + '. Файл: ' + newest], self.calls)
+        self.assertEqual(self.shown, [['space.select', '--id', 'sp1'], ['tab.select', '--id', 'tb1']])
+        # Another program now holds the address: no text is typed into it.
+        self.terminals['t7']['created_ms'] = 200
+        self.calls.clear()
+        with self.patched():
+            with self.assertRaisesRegex(ValueError, 'terminal is gone'):
+                h.notify_agent(self.session)
+        self.assertFalse([c for c in self.calls if c[0] == 'send'])
+
+    def test_finish_closes_only_the_grill_terminal(self):
+        with self.patched():
+            owner = self.open()
+            h.hc_close(owner, self.session)
+        self.assertEqual([c for c in self.calls if c[0] in ('kill', 'rm')], [['kill', 't20'], ['rm', 't20']])
+
+
 class HandoffTests(unittest.TestCase):
     """A live handoff keeps panes and processes; a restart kills the TUI."""
     def setUp(self):

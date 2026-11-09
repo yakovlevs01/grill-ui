@@ -6,7 +6,7 @@
 
 ## Установка
 
-Нужны Linux или macOS, Python 3.11+, Node.js с `npx` и установленный Codex CLI или Claude Code с выполненным входом. Для отдельной вкладки нужен Herdr 0.9+. Windows без Linux-окружения не поддерживается.
+Нужны Linux или macOS, Python 3.11+, Node.js с `npx` и установленный Codex CLI или Claude Code с выполненным входом. Для отдельной вкладки нужен Herdr app (`herdr-app`) или Herdr 0.9+. Windows без Linux-окружения не поддерживается.
 
 Установите через [Vercel Skills](https://skills.sh/docs), выбрав Codex или Claude Code:
 
